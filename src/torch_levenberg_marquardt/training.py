@@ -1,3 +1,4 @@
+import logging
 from abc import ABC, abstractmethod
 from typing import Any, Literal
 
@@ -9,6 +10,8 @@ from torch.func import functional_call, jacrev
 
 from .damping import DampingStrategy, StandardDampingStrategy
 from .loss import Loss, MSELoss
+
+logger = logging.getLogger(__name__)
 
 
 class TrainingModule(ABC):
@@ -400,7 +403,7 @@ class LevenbergMarquardtModule(TrainingModule):
                             param.add_(-self.learning_rate * update)
 
             except Exception as e:
-                print(f'An error occurred: {e}')
+                logger.warning(f'An exception occurred: {e}')
 
             if attempt < self.attempts_per_step:
                 attempt += 1
