@@ -5,6 +5,8 @@
 
 A PyTorch implementation of the **Levenberg-Marquardt (LM)** optimization algorithm, supporting **mini-batch training** for both **regression** and **classification** problems. It leverages GPU acceleration and offers an extensible framework, supporting diverse loss functions and customizable damping strategies.
 
+A TensorFlow implementation is also available: [tf-levenberg-marquardt](https://github.com/fabiodimarco/tf-levenberg-marquardt)
+
 For more information on the theory behind the Levenberg-Marquardt and Gauss-Newton algorithms, refer to the following resources:
 [Levenberg-Marquardt](https://en.wikipedia.org/wiki/Levenberg%E2%80%93Marquardt_algorithm),
 [Gauss-Newton](https://en.wikipedia.org/wiki/Gauss%E2%80%93Newton_algorithm).
