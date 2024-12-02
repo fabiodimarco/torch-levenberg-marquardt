@@ -15,9 +15,9 @@ from torchvision import datasets, transforms
 torch.set_float32_matmul_precision('high')
 
 # Detect CUDA device for acceleration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-accelerator = 'gpu' if torch.cuda.is_available() else None
-devices = 1 if torch.cuda.is_available() else None
+accelerator = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = torch.device(accelerator)
+devices = 1
 print(f'Using device: {device}')
 
 # %%
