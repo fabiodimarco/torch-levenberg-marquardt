@@ -1,12 +1,13 @@
 # PyTorch Levenberg-Marquardt
 
 [![PyPI](https://img.shields.io/pypi/v/torch-levenberg-marquardt)](https://pypi.org/project/torch-levenberg-marquardt/)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/fabiodimarco/torch-levenberg-marquardt/blob/main/examples/torch_levenberg_marquardt.ipynb)
 
 A PyTorch implementation of the **Levenberg-Marquardt (LM)** optimization algorithm, supporting **mini-batch training** for both **regression** and **classification** problems. It leverages GPU acceleration and offers an extensible framework, supporting diverse loss functions and customizable damping strategies.
 
 For more information on the theory behind the Levenberg-Marquardt and Gauss-Newton algorithms, refer to the following resources:
 [Levenberg-Marquardt](https://en.wikipedia.org/wiki/Levenberg%E2%80%93Marquardt_algorithm),
-[Gauss–Newton](https://en.wikipedia.org/wiki/Gauss%E2%80%93Newton_algorithm).
+[Gauss-Newton](https://en.wikipedia.org/wiki/Gauss%E2%80%93Newton_algorithm).
 
 ## Why Levenberg-Marquardt?
 
@@ -185,7 +186,7 @@ where:
 - $\large f\left(x_i, W\right)$ represents the model output for input $\large x_i$ and parameters $\large W$,
 - $\large N$ is the number of data points.
 
-In what follows, the Gauss–Newton algorithm will be derived from Newton's method for function optimization via an approximation.
+In what follows, the Gauss-Newton algorithm will be derived from Newton's method for function optimization via an approximation.
 The recurrence relation for Newton's method for minimizing a function $\large S$ of parameters $\large W$ is:
 
 $$
@@ -206,7 +207,7 @@ $$
 \large H_{jk} = 2 \sum_{i=1}^N \left( \frac{\partial r_i}{\partial w_j} \frac{\partial r_i}{\partial w_k} + r_i \frac{\partial^2 r_i}{\partial w_j \partial w_k} \right)
 $$
 
-The Gauss–Newton method is obtained by ignoring the second-order derivative terms (the second term in this expression). That is, the Hessian is approximated by
+The Gauss-Newton method is obtained by ignoring the second-order derivative terms (the second term in this expression). That is, the Hessian is approximated by
 
 $$
 \large H_{jk} \approx 2 \sum_{i=1}^N J_{ij} J_{ik}, \quad J_{ij} = \frac{\partial r_i}{\partial w_j}
@@ -335,7 +336,7 @@ When using the Split Jacobian computation, the memory usage is primarily determi
 ## Results
 ### Curve fitting
 A simple curve-fitting example is implemented in `examples/sinc_curve_fitting.py` and `examples/sinc_curve_fitting_lightning.py`. The function `y = sinc(10 * x)` is fitted using a shallow neural network with 61 parameters.
-Despite the simplicity of the problem, first-order methods such as Adam fail to converge, whereas Levenberg–Marquardt converges rapidly with very low loss values. The learning rate values were chosen experimentally based on the results obtained by each algorithm.
+Despite the simplicity of the problem, first-order methods such as Adam fail to converge, whereas Levenberg-Marquardt converges rapidly with very low loss values. The learning rate values were chosen experimentally based on the results obtained by each algorithm.
 
 Here the results with Adam for 10000 epochs and learning_rate=0.01
 ```
@@ -345,7 +346,7 @@ Epoch 9999: 100%|██████████| 20/20 [00:00<00:00, 81.07it/s, 
 Epoch 9999: 100%|██████████| 20/20 [00:00<00:00, 80.21it/s, loss_step=0.000461, loss_epoch=0.000412]
 Training completed. Elapsed time: 2604.56 seconds
 ```
-Here the results with Levenberg–Marquardt for 100 epochs and learning_rate=1.0
+Here the results with Levenberg-Marquardt for 100 epochs and learning_rate=1.0
 ```
 Training with Levenberg-Marquardt...
 Epoch 49: 100%|██████████| 20/20 [00:00<00:00, 64.07it/s, loss_step=2.79e-7, damping_factor=1e-6, attempts=3.000, loss_epoch=3.31e-7]
@@ -358,7 +359,7 @@ Training completed. Elapsed time: 16.60 seconds
 
 ### Mnist dataset classification
 A common MNIST classification example is implemented in `examples/mnist_classification.py.py` and `examples/mnist_classification_lightning.py.py`. The classification is performed using a convolutional neural network with 1026 parameters.
-Both optimization methods achieve roughly the same accuracy on the training and test sets; however, Levenberg–Marquardt requires significantly fewer epochs, automatically stopping the training at epoch 8.
+Both optimization methods achieve roughly the same accuracy on the training and test sets; however, Levenberg-Marquardt requires significantly fewer epochs, automatically stopping the training at epoch 8.
 
 Here the results with Adam for 100 epochs and learning_rate=0.01
 ```
@@ -371,7 +372,7 @@ Training completed. Elapsed time: 125.33 seconds
 
 Adam - Test Loss: 0.089224, Test Accuracy: 97.32%
 ```
-Here the results with Levenberg–Marquardt for 10 epochs and learning_rate=0.05
+Here the results with Levenberg-Marquardt for 10 epochs and learning_rate=0.05
 ```
 Train using Levenberg-Marquardt
 Training with Levenberg-Marquardt...
