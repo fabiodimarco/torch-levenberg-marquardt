@@ -1,0 +1,46 @@
+{
+    "search.followSymlinks": false,
+    "files.exclude": {
+        "**/__pycache__/**": true
+    },
+    "files.trimTrailingWhitespace": true,
+    "cSpell.customDictionaries": {
+        "dictionary": {
+            "name": "dictionary",
+            "path": "${workspaceFolder}/.cspell/dictionary.txt",
+            "addWords": true,
+            "scope": "workspace"
+        }
+    },
+    "editor.comments.ignoreEmptyLines": false,
+    "editor.codeActionsOnSave": {
+        "source.organizeImports": "explicit"
+    },
+    "editor.formatOnSave": true,
+    "editor.defaultFormatter": "ms-python.black-formatter",
+    "black-formatter.args": [
+        "--skip-string-normalization"
+    ],
+    "flake8.args": [
+        "--max-line-length=88",
+        "--select=C,E,F,W,B,B950",
+        "--ignore=E203,W503"
+    ],
+    "isort.args": [
+        "--src=${workspaceFolder}",
+        "--profile", "black",
+    ],
+    "isort.check": true,
+    "python.languageServer": "Pylance",
+    "jupyter.notebookFileRoot": "${workspaceFolder}",
+    "python.testing.pytestArgs": [
+        "."
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": false,
+    "jupyter.interactiveWindow.textEditor.magicCommandsAsComments": true,
+    "notebook.output.textLineLimit": 200,
+    "python.analysis.inlayHints.functionReturnTypes": true,
+    "python.analysis.autoFormatStrings": true,
+    "python.analysis.typeCheckingMode": "basic",
+}

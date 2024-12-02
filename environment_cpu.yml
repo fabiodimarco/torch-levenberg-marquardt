@@ -1,0 +1,21 @@
+name: torch-levenberg-marquardt-cpu
+
+channels:
+  - pytorch
+  - defaults
+
+dependencies:
+  - python=3.10.11
+  - cpuonly
+  - numpy
+  - pytorch=2.0.1
+  - pytorch-lightning=1.9.3
+  - tqdm
+  - torchmetrics
+  - torchvision
+  - bokeh
+  - ipykernel
+  - black
+  - flake8
+  - pip:
+      - -e .

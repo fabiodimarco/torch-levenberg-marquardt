@@ -1,0 +1,20 @@
+name: torch-levenberg-marquardt-macos
+
+channels:
+  - pytorch
+  - defaults
+
+dependencies:
+  - python=3.10.11
+  - numpy
+  - pytorch=2.0.1
+  - torchvision
+  - pytorch-lightning=1.9.3
+  - tqdm
+  - torchmetrics
+  - bokeh
+  - ipykernel
+  - black
+  - flake8
+  - pip:
+      - -e .
