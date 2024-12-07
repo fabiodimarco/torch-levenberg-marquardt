@@ -6,7 +6,6 @@ import time
 
 import torch
 import torch_levenberg_marquardt as tlm
-from torch.utils.data import DataLoader
 from torchmetrics import Accuracy
 from torchvision import datasets, transforms
 
@@ -30,18 +29,21 @@ test_dataset = datasets.MNIST(
     root='./data', train=False, download=True, transform=transform
 )
 
-# Create DataLoaders with updated num_workers for parallelism
-train_loader = DataLoader(
-    train_dataset,
+# Initialize FastDatasetLoader for training and test datasets
+train_loader = tlm.utils.FastDataLoader(
+    dataset=train_dataset,
     batch_size=batch_size,
+    repeat=10,
     shuffle=True,
-    pin_memory=True,
+    device=device,
 )
-test_loader = DataLoader(
-    test_dataset,
+
+test_loader = tlm.utils.FastDataLoader(
+    dataset=test_dataset,
     batch_size=batch_size,
+    repeat=1,
     shuffle=False,
-    pin_memory=True,
+    device=device,
 )
 
 
@@ -73,17 +75,27 @@ model_lm = create_conv_model()
 num_parameters = sum(p.numel() for p in model_lm.parameters() if p.requires_grad)
 print(f'Number of trainable parameters: {num_parameters}')
 
+module = tlm.training.OptimizerModule(
+    model=model,
+    optimizer=torch.optim.Adam(model.parameters(), lr=0.01),
+    loss_fn=torch.nn.CrossEntropyLoss(),
+)
+
+module_lm = tlm.training.LevenbergMarquardtModule(
+    model=model_lm,
+    loss_fn=tlm.loss.CrossEntropyLoss(),
+    learning_rate=0.05,
+    attempts_per_step=10,
+    solve_method='cholesky',
+)
+
 # %%
 # Train the model using the Adam optimizer
 print('\nTraining with Adam optimizer...')
 t1_start = time.perf_counter()
 
 tlm.utils.fit(
-    tlm.training.OptimizerModule(
-        model=model,
-        optimizer=torch.optim.Adam(model.parameters(), lr=0.01),
-        loss_fn=torch.nn.CrossEntropyLoss(),
-    ),
+    module,
     train_loader,
     epochs=10,
     metrics={'accuracy': Accuracy(task='multiclass', num_classes=10)},
@@ -98,14 +110,7 @@ print('\nTraining with Levenberg-Marquardt...')
 t2_start = time.perf_counter()
 
 tlm.utils.fit(
-    tlm.training.LevenbergMarquardtModule(
-        model=model_lm,
-        loss_fn=tlm.loss.CrossEntropyLoss(),
-        learning_rate=0.05,
-        attempts_per_step=10,
-        solve_method='qr',
-        jacobian_max_num_rows=200,  # Optimize memory usage for large datasets
-    ),
+    module_lm,
     train_loader,
     epochs=10,
     metrics={'accuracy': Accuracy(task='multiclass', num_classes=10)},

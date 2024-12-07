@@ -7,7 +7,7 @@ import time
 import torch
 import torch_levenberg_marquardt as tlm
 from bokeh.plotting import figure, output_notebook, show
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import TensorDataset
 
 # Set PyTorch to use high precision for matrix multiplication
 torch.set_float32_matmul_precision('high')
@@ -27,7 +27,13 @@ y_train = torch.sinc(10 * x_train).to(device)
 
 # Create dataset and dataloader
 train_dataset = TensorDataset(x_train, y_train)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+train_loader = tlm.utils.FastDataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    repeat=10,
+    shuffle=True,
+    device=device,
+)
 
 
 # %%
@@ -48,19 +54,29 @@ model_lm = create_model()
 num_parameters = sum(p.numel() for p in model_lm.parameters() if p.requires_grad)
 print(f'Number of trainable parameters: {num_parameters}')
 
+module = tlm.training.OptimizerModule(
+    model=model,
+    optimizer=torch.optim.Adam(model.parameters(), lr=0.01),
+    loss_fn=torch.nn.MSELoss(),
+)
+
+module_lm = tlm.training.LevenbergMarquardtModule(
+    model=model_lm,
+    loss_fn=tlm.loss.MSELoss(),
+    learning_rate=1.0,
+    attempts_per_step=10,
+    solve_method='qr',
+)
+
 # %%
 # Train the model using the Adam optimizer
 print('Training with Adam optimizer...')
 t1_start = time.perf_counter()
 
 tlm.utils.fit(
-    tlm.training.OptimizerModule(
-        model=model,
-        optimizer=torch.optim.Adam(model.parameters(), lr=0.01),
-        loss_fn=torch.nn.MSELoss(),
-    ),
+    module,
     train_loader,
-    epochs=50,
+    epochs=10,
 )
 
 t1_stop = time.perf_counter()
@@ -72,16 +88,9 @@ print('Training with Levenberg-Marquardt...')
 t2_start = time.perf_counter()
 
 tlm.utils.fit(
-    tlm.training.LevenbergMarquardtModule(
-        model=model_lm,
-        loss_fn=tlm.loss.MSELoss(),
-        learning_rate=1.0,
-        attempts_per_step=10,
-        solve_method='solve',
-        # jacobian_max_num_rows=100,  # Uncomment if memory optimization is needed
-    ),
+    module_lm,
     train_loader,
-    epochs=50,
+    epochs=10,
 )
 
 t2_stop = time.perf_counter()

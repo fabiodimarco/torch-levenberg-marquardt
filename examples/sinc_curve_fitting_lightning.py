@@ -8,7 +8,7 @@ import pytorch_lightning as pl
 import torch
 import torch_levenberg_marquardt as tlm
 from bokeh.plotting import figure, output_notebook, show
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import TensorDataset
 
 # Set PyTorch to use high precision for matrix multiplication
 torch.set_float32_matmul_precision('high')
@@ -30,7 +30,13 @@ y_train = torch.sinc(10 * x_train).to(device)
 
 # Create dataset and dataloader
 train_dataset = TensorDataset(x_train, y_train)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+train_loader = tlm.utils.FastDataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    repeat=10,
+    shuffle=True,
+    device=device,
+)
 
 
 # %%
@@ -68,15 +74,14 @@ module_lm = tlm.utils.CustomLightningModule(
         loss_fn=tlm.loss.MSELoss(),
         learning_rate=1.0,
         attempts_per_step=10,
-        solve_method='solve',
-        # jacobian_max_num_rows=100,  # Uncomment if memory optimization is needed
+        solve_method='qr',
     )
 ).to(device)
 
 # %%
 # Create PyTorch Lightning Trainers
 trainer = pl.Trainer(
-    max_epochs=50,
+    max_epochs=10,
     accelerator=accelerator,
     devices=devices,
     logger=False,
@@ -85,7 +90,7 @@ trainer = pl.Trainer(
 )
 
 trainer_lm = pl.Trainer(
-    max_epochs=50,
+    max_epochs=10,
     accelerator=accelerator,
     devices=devices,
     logger=False,

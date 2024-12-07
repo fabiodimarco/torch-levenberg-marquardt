@@ -7,7 +7,6 @@ import time
 import pytorch_lightning as pl
 import torch
 import torch_levenberg_marquardt as tlm
-from torch.utils.data import DataLoader
 from torchmetrics import Accuracy
 from torchvision import datasets, transforms
 
@@ -33,18 +32,21 @@ test_dataset = datasets.MNIST(
     root='./data', train=False, download=True, transform=transform
 )
 
-# Create DataLoaders with updated num_workers for parallelism
-train_loader = DataLoader(
-    train_dataset,
+# Initialize FastDatasetLoader for training and test datasets
+train_loader = tlm.utils.FastDataLoader(
+    dataset=train_dataset,
     batch_size=batch_size,
+    repeat=10,
     shuffle=True,
-    pin_memory=True,
+    device=device,
 )
-test_loader = DataLoader(
-    test_dataset,
+
+test_loader = tlm.utils.FastDataLoader(
+    dataset=test_dataset,
     batch_size=batch_size,
+    repeat=1,
     shuffle=False,
-    pin_memory=True,
+    device=device,
 )
 
 
@@ -93,8 +95,7 @@ module_lm = tlm.utils.CustomLightningModule(
         loss_fn=tlm.loss.CrossEntropyLoss(),
         learning_rate=0.05,
         attempts_per_step=10,
-        solve_method='qr',
-        jacobian_max_num_rows=200,  # Optimize memory usage for large datasets
+        solve_method='cholesky',
     ),
     metrics={'accuracy': Accuracy(task='multiclass', num_classes=10)},
 ).to(device)

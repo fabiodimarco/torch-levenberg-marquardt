@@ -1,7 +1,9 @@
+from typing import Generator
+
 import pytorch_lightning as pl
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchmetrics import Metric
 from tqdm import tqdm
 
@@ -114,25 +116,28 @@ def fit(
     dataloader: DataLoader,
     epochs: int,
     metrics: dict[str, Metric] | None = None,
+    overwrite_progress_bar: bool = True,
+    update_every_n_steps: int = 1,
 ) -> None:
-    """Fit function with support for TrainingModule and individual torchmetrics.
+    """Fit function with support for TrainingModule and torchmetrics.
 
-    Manually trains the model for a specified number of epochs. This function
-    supports logging metrics using `torchmetrics` and provides detailed progress
-    tracking using `tqdm`.
+    Trains the model for a specified number of epochs. It supports logging metrics using
+    `torchmetrics` and provides detailed progress tracking using `tqdm`.
 
     Args:
         training_module: A `TrainingModule` encapsulating the training logic.
-        dataloader: A PyTorch DataLoader providing `(inputs, targets)` tuples.
-        epochs: The number of epochs to train the model.
-        metrics: A dictionary of `torchmetrics.Metric` objects for evaluation,
-            with metric names as keys. Defaults to None.
+        dataloader: A PyTorch DataLoader.
+        epochs: The number of epochs.
+        metrics: Optional dict of torchmetrics.Metric objects.
+        overwrite_progress_bar: If True, mimic a single-line progress bar similar
+            to PyTorch Lightning (old bars overwritten).
+        update_every_n_steps: Update the progress bar and displayed logs every n steps.
     """
+    assert update_every_n_steps > 0
+    device = training_module.device
     steps = len(dataloader)
     stop_training = False
 
-    # Move metrics to the correct device
-    device = training_module.device
     if metrics:
         metrics = {name: metric.to(device) for name, metric in metrics.items()}
 
@@ -140,43 +145,37 @@ def fit(
         if stop_training:
             break
 
-        print(f'Epoch {epoch + 1}/{epochs}')
-
+        # Create a new progress bar for this epoch
         progress_bar = tqdm(
-            enumerate(dataloader),
             total=steps,
             desc=f'Epoch {epoch + 1}/{epochs}',
-            leave=True,
+            leave=not overwrite_progress_bar,  # Leave bar if overwrite is False
             dynamic_ncols=True,
         )
+        total_loss = 0.0
+        steps_since_update = 0
 
-        total_loss = 0
-
-        for _, (inputs, targets) in progress_bar:
-            # Move inputs and targets to the correct device
+        for step, (inputs, targets) in enumerate(dataloader):
+            # Ensure that inputs and targets are on the same device as the model
             inputs, targets = inputs.to(device), targets.to(device)
-
-            if stop_training:
-                break
 
             # Perform a training step
             outputs, loss, stop_training, logs = training_module.training_step(
                 inputs, targets
             )
 
-            # Compute metrics if defined
-            metric_logs = {}
-            if metrics:
-                for name, metric in metrics.items():
-                    metric_logs[name] = metric(outputs, targets)
-
             total_loss += loss.item()
 
-            # Format logs for the progress bar
+            # Update metrics if provided
+            if metrics:
+                for name, metric in metrics.items():
+                    metric(outputs, targets)
+
+            # Format logs
             formatted_logs = {'loss': f'{loss:.4e}'}
-            formatted_logs.update(
-                {name: value.item() for name, value in metric_logs.items()}
-            )
+            if metrics:
+                for name, metric in metrics.items():
+                    formatted_logs[name] = metric.compute().item()
             for key, value in logs.items():
                 if isinstance(value, torch.Tensor):
                     value = value.item()
@@ -184,14 +183,129 @@ def fit(
                     f'{value:.4e}' if isinstance(value, float) else str(value)
                 )
 
-            # Update the progress bar with formatted metrics
-            progress_bar.set_postfix(formatted_logs)
+            steps_since_update += 1
+            if (
+                steps_since_update == update_every_n_steps
+                or step == steps - 1
+                or stop_training
+            ):
+                # Update the progress bar and logs
+                progress_bar.update(steps_since_update)
+                progress_bar.set_postfix(formatted_logs)
+                steps_since_update = 0
 
-        # Reset all metrics at the end of each epoch
+            if stop_training:
+                # End early, ensure progress bar remains visible
+                progress_bar.leave = True
+                break
+
+        # Reset metrics at the end of the epoch
         if metrics:
             for metric in metrics.values():
                 metric.reset()
 
-        print(f'Epoch {epoch + 1} complete. Average loss: {total_loss / steps:.4e}')
+        # Epoch summary
+        avg_loss = total_loss / steps
+        if overwrite_progress_bar:
+            progress_bar.set_postfix({'epoch_avg_loss': f'{avg_loss:.4e}'})
+        else:
+            progress_bar.write(
+                f'Epoch {epoch + 1} complete. Average loss: {avg_loss:.4e}'
+            )
 
-    print('Training complete.')
+        # Ensure the final progress bar is left visible
+        if epoch == epochs - 1 or stop_training:
+            progress_bar.leave = True
+
+        progress_bar.close()
+
+    # Final training summary
+    if overwrite_progress_bar:
+        print(f'Training complete. Final epoch average loss: {avg_loss:.4e}')
+
+
+class FastDataLoader(DataLoader):
+    """A lightweight and efficient data loader optimized for small datasets.
+
+    This class addresses the performance bottleneck caused by the overhead of
+    `torch.utils.data.DataLoader` when dealing with small models or datasets that can
+    fit entirely into RAM or GPU memory. By preloading the entire dataset into memory,
+    it eliminates unnecessary overhead and significantly accelerates the training.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        batch_size: int,
+        repeat: int = 1,
+        shuffle: bool = False,
+        device: torch.device | str = 'cpu',
+    ) -> None:
+        """
+        Initializes the FastDataLoader.
+
+        Args:
+            dataset: A PyTorch Dataset from which data and targets will be extracted.
+            batch_size: Number of samples per batch.
+            repeat: Number of times to repeat the dataset.
+            shuffle: If True, shuffle the data at the start of each repetition.
+
+        Raises:
+            ValueError: If data and targets have mismatched sizes.
+        """
+        super().__init__(dataset=dataset, batch_size=batch_size)
+
+        self.repeat = repeat
+        self.shuffle = shuffle
+
+        data, targets = zip(*((data, target) for data, target in dataset))
+
+        assert len(data) > 0
+        assert len(targets) > 0
+
+        self.data = (
+            torch.stack(data)
+            if isinstance(data[0], torch.Tensor)
+            else torch.tensor(data)
+        ).to(device)
+        self.targets = (
+            torch.stack(targets)
+            if isinstance(targets[0], torch.Tensor)
+            else torch.tensor(targets)
+        ).to(device)
+
+        if self.data.size(0) != self.targets.size(0):
+            raise ValueError("Data and targets must have the same number of samples.")
+
+        self.n_samples = self.data.size(0)
+
+    def __iter__(self) -> Generator[tuple[Tensor, Tensor], None, None]:
+        """
+        Generates batches of data and targets.
+
+        Yields:
+            A tuple (batch_data, batch_targets) for each batch.
+        """
+        assert self.batch_size
+
+        for _ in range(self.repeat):
+            indices = torch.arange(self.n_samples)
+            if self.shuffle:
+                indices = indices[torch.randperm(self.n_samples)]
+
+            for i in range(0, self.n_samples, self.batch_size):
+                batch_indices = indices[i : i + self.batch_size]
+                yield self.data[batch_indices], self.targets[batch_indices]
+
+    def __len__(self) -> int:
+        """
+        Returns the total number of batches.
+
+        Returns:
+            Total number of batches across all repeats.
+        """
+        assert self.n_samples
+        assert self.batch_size
+
+        batches_per_epoch = (self.n_samples + self.batch_size - 1) // self.batch_size
+        return self.repeat * batches_per_epoch
