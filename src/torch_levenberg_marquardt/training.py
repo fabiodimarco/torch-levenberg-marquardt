@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 # pyright: reportPrivateImportUsage=false
-from torch.func import functional_call, jacrev
+from torch.func import functional_call, jacrev, vmap
 
 from .damping import DampingStrategy, StandardDampingStrategy
 from .loss import Loss, MSELoss
@@ -48,6 +48,7 @@ class LevenbergMarquardtModule(TrainingModule):
         loss_fn: Loss | None = None,
         damping_strategy: DampingStrategy | None = None,
         jacobian_max_num_rows: int | None = None,
+        use_vmap: bool = True,
         learning_rate: float = 1.0,
         attempts_per_step: int = 10,
         solve_method: Literal['qr', 'cholesky', 'solve'] = 'qr',
@@ -67,6 +68,11 @@ class LevenbergMarquardtModule(TrainingModule):
                 Hessian matrix approximation. This approach reduces memory usage and
                 improves computational efficiency. Each Jacobian matrix will contain at
                 most `jacobian_max_num_rows` rows.
+            use_vmap: Specifies whether to use `torch.vmap` for Jacobian computation.
+                Enabling `vmap` is generally the preferred choice as it is faster
+                and requires less memory, especially for medium to large models.
+                For very small models or simple cases, computing the Jacobian
+                without `vmap` might be marginally more efficient. Defaults to `True`.
             learning_rate: Specifies the step size for updating the model parameters.
                 The update is performed using the formula `w = w - lr * updates`,
                 where `updates` are calculated by the Levenberg-Marquardt algorithm.
@@ -86,45 +92,71 @@ class LevenbergMarquardtModule(TrainingModule):
         """
         self._model = model
 
+        # Set up loss function and damping strategy
         self.loss_fn = loss_fn or MSELoss()
         self.damping_strategy = damping_strategy or StandardDampingStrategy()
+
+        # Hyperparameters
         self.jacobian_max_num_rows = jacobian_max_num_rows
+        self.use_vmap = use_vmap
         self.learning_rate = learning_rate
         self.attempts_per_step = attempts_per_step
-
         self.solve_method = solve_method
 
         # Initialize damping factor
         self.damping_factor = self.damping_strategy.get_starting_value()
 
-        # Backup for model parameters
-        self._backup_parameters: list[Tensor] = []
+        # Extract trainable parameters
+        self._params = {
+            n: p for n, p in self._model.named_parameters() if p.requires_grad
+        }
+        self._num_parameters = sum(p.numel() for p in self._params.values())
 
-        # Parameters required for computing updates
-        self._params = [p for p in self._model.parameters() if p.requires_grad]
-        self._splits = [p.numel() for p in self._params]
-        self._shapes = [p.shape for p in self._params]
-        self._num_parameters = sum(self._splits)
+        # Flatten all trainable parameters into a single tensor
+        self.flat_params = torch.cat(
+            [p.detach().flatten() for p in self._params.values()]
+        )
+
+        # Bind model parameters to slices of the flat parameter tensor
+        start = 0
+        for _, p in self._params.items():
+            size = p.numel()
+            p.data = self.flat_params[start : start + size].view_as(p)
+            start += size
+
+        # Backup storage for parameters
+        self._flat_params_backup: Tensor
+        self.backup_parameters()  # Initialize backup with the current parameters
+
+        # Combine named parameters and buffers into a single dictionary for inference
+        self._params_and_buffers = {
+            **dict(self._model.named_parameters()),
+            **dict(self._model.named_buffers()),
+        }
+
         self._num_outputs = None
 
-    def reset(self) -> None:
-        """Resets the trainer state.
+    @torch.no_grad()
+    def backup_parameters(self) -> None:
+        """Backs up the current model parameters into a separate tensor."""
+        self._flat_params_backup = self.flat_params.clone()
 
-        Resets the damping factor and internal counters.
-        """
+    @torch.no_grad()
+    def restore_parameters(self) -> None:
+        """Restores model parameters from the backup tensor."""
+        self.flat_params.copy_(self._flat_params_backup)
+
+    @torch.no_grad()
+    def reset(self) -> None:
+        """Resets internal state, including the damping factor and outputs."""
         self._num_outputs = None
         self.damping_factor = self.damping_strategy.get_starting_value()
 
-    def backup_parameters(self) -> None:
-        """Backs up the current model parameters."""
-        self._backup_parameters = [param.clone() for param in self._params]
+    def forward(self, inputs: Tensor) -> Tensor:
+        """Performs a forward pass using the current model parameters."""
+        return functional_call(self._model, self._params_and_buffers, inputs)
 
-    def restore_parameters(self) -> None:
-        """Restores the model parameters from the backup."""
-        with torch.no_grad():
-            for param, backup in zip(self._params, self._backup_parameters):
-                param.copy_(backup)
-
+    @torch.no_grad()
     def _compute_num_outputs(self, inputs: Tensor, targets: Tensor) -> int:
         """Computes the number of outputs from the model.
 
@@ -137,7 +169,7 @@ class LevenbergMarquardtModule(TrainingModule):
         """
         # Create dummy inputs and targets with batch size zero
         input_shape = inputs.shape[1:]  # Exclude batch dimension
-        target_shape = targets.shape[1:]
+        target_shape = targets.shape[1:]  # Exclude batch dimension
 
         dummy_inputs = torch.zeros(
             (1,) + input_shape, dtype=inputs.dtype, device=inputs.device
@@ -155,7 +187,7 @@ class LevenbergMarquardtModule(TrainingModule):
         return residuals.numel()
 
     def _solve(self, matrix: Tensor, rhs: Tensor) -> Tensor:
-        """Solves the linear system using QR decomposition.
+        """Solves the linear system using the specified solver.
 
         Args:
             matrix: The matrix representing the linear system.
@@ -181,6 +213,15 @@ class LevenbergMarquardtModule(TrainingModule):
                 "Choose from 'qr', 'cholesky', 'solve'."
             )
 
+    @torch.no_grad()
+    def _apply_updates(self, updates: Tensor) -> None:
+        """Applies parameter updates directly to flat_params.
+
+        Args:
+            updates: The computed parameter updates.
+        """
+        self.flat_params.add_(-self.learning_rate * updates.view(-1))
+
     def _compute_jacobian(
         self,
         inputs: Tensor,
@@ -200,49 +241,57 @@ class LevenbergMarquardtModule(TrainingModule):
                 - residuals: Residual vector of shape `(num_residuals, 1)`.
                 - outputs: Model outputs of shape `(batch_size, target_dim, ...)`.
         """
-        # Filter parameters that require gradients
-        params = {
-            name: p for name, p in self._model.named_parameters() if p.requires_grad
-        }
         buffers = dict(self._model.named_buffers())
 
-        # Capture outputs and residuals
-        captured_outputs = None
-        captured_residuals = None
+        def compute_residuals_per_sample(
+            flat_params: Tensor, input: Tensor, target: Tensor
+        ) -> Tensor:
+            input = input.unsqueeze(0)
+            target = target.unsqueeze(0)
 
-        # Define a function that computes residuals given parameters
-        def compute_residuals(params):
-            nonlocal captured_outputs, captured_residuals
-            outputs = functional_call(self._model, {**params, **buffers}, inputs)
+            # Reconstruct trainable parameter dictionary from flat_params
+            params = {}
+            start = 0
+            for n, p in self._params.items():
+                size = p.numel()
+                params[n] = flat_params[start : start + size].view_as(p)
+                start += size
+
+            # Merge model buffers into the parameter dictionary
+            params_and_buffers = params | buffers
+
+            # Compute outputs and residuals
+            output = functional_call(self._model, params_and_buffers, input)
+            residual = self.loss_fn.residuals(target, output).view(-1)
+            return residual
+
+        def compute_residuals(params) -> Tensor:
+            params_and_buffers = params | buffers
+            outputs = functional_call(self._model, params_and_buffers, inputs)
             residuals = self.loss_fn.residuals(targets, outputs).view(-1)
-            captured_outputs = outputs
-            captured_residuals = residuals
             return residuals
 
-        # Compute the Jacobian of residuals with respect to parameters
-        jacobian_params: dict[str, Tensor]
-        jacobian_params = jacrev(compute_residuals)(params)  # type: ignore
+        # Compute outputs and residuals for the full batch
+        outputs = self.forward(inputs)
+        residuals = self.loss_fn.residuals(targets, outputs).view(-1, 1)
 
-        # Retrieve captured outputs and residuals
-        assert captured_outputs is not None
-        assert captured_residuals is not None
-        outputs = captured_outputs
-        residuals = captured_residuals
+        if self.use_vmap:
+            # Compute the Jacobian with vmap
+            jacobian_func = jacrev(compute_residuals_per_sample)
+            jacobian_func_vmap = vmap(jacobian_func, in_dims=(None, 0, 0))
+            jacobians = jacobian_func_vmap(self.flat_params, inputs, targets)
+            assert isinstance(jacobians, Tensor)
+            J = jacobians.reshape(-1, self._num_parameters)
+        else:
+            # Compute the Jacobian without vmap
+            num_residuals = residuals.numel()
+            jacobian_func = jacrev(compute_residuals)
+            jacobians = jacobian_func(self._params)
+            assert isinstance(jacobians, dict)
+            jacobians = [j.reshape(num_residuals, -1) for j in jacobians.values()]
+            J = torch.cat(jacobians, dim=1)
 
-        # Flatten and concatenate the gradients to form the Jacobian matrix
-        jacobian_matrices = []
-        for _, j in jacobian_params.items():
-            # j has shape: (num_residuals, param_shape...)
-            # Reshape to (num_residuals, param_numel)
-            j = j.reshape(residuals.numel(), -1)
-            jacobian_matrices.append(j)
-
-        # Shape: (num_residuals, total_num_params)
-        jacobian = torch.cat(jacobian_matrices, dim=1)
-
-        residuals = residuals.unsqueeze(-1)
-
-        return jacobian, residuals, outputs
+        return J, residuals, outputs
 
     def _sliced_gauss_newton(
         self, inputs: Tensor, targets: Tensor
@@ -336,7 +385,6 @@ class LevenbergMarquardtModule(TrainingModule):
         if self._num_outputs is None:
             # Initialize during the first train step
             self._num_outputs = self._compute_num_outputs(inputs, targets)
-            self.backup_parameters()
 
         batch_size = inputs.shape[0]
         num_residuals = batch_size * self._num_outputs
@@ -390,17 +438,7 @@ class LevenbergMarquardtModule(TrainingModule):
                 # Check if updates are finite
                 if torch.all(torch.isfinite(updates)):
                     params_updated = True
-                    # Split and reshape the updates
-                    updates = torch.split(updates.view(-1), self._splits)
-                    updates = [
-                        update.view(shape)
-                        for update, shape in zip(updates, self._shapes)
-                    ]
-
-                    # Apply the updates to the model parameters
-                    with torch.no_grad():
-                        for param, update in zip(self._params, updates):
-                            param.add_(-self.learning_rate * update)
+                    self._apply_updates(updates)
 
             except Exception as e:
                 logger.warning(f'An exception occurred: {e}')
@@ -410,8 +448,8 @@ class LevenbergMarquardtModule(TrainingModule):
 
                 if params_updated:
                     # Compute the new loss value
-                    outputs = self._model(inputs)
-                    new_loss = self.loss_fn(targets, outputs)
+                    new_outputs = self.forward(inputs)
+                    new_loss = self.loss_fn(targets, new_outputs)
 
                     if new_loss < loss:
                         # Accept the new model parameters and backup them
