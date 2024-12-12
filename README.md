@@ -28,6 +28,7 @@ This makes it a strong choice for problems with manageable model sizes.
 - **Mini-batch Training**: Scale LM to large datasets for both regression and classification tasks.
 - **Custom Damping Strategies**: Adapt the damping factor dynamically for stable optimization.
 - **Split Jacobian Matrix Computation**: Split the Computation of the Jacobian and Hessian matrix approximation to reduce memory usage.
+- **Custom Param Selection Strategies**: Select a subset of model parameters to update during the training step.
 
 ## Supported Loss Functions
 

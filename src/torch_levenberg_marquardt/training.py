@@ -10,6 +10,7 @@ from torch.func import functional_call, jacrev, vmap
 
 from .damping import DampingStrategy, StandardDampingStrategy
 from .loss import Loss, MSELoss
+from .selection import ParamSelectionStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +48,12 @@ class LevenbergMarquardtModule(TrainingModule):
         model: torch.nn.Module,
         loss_fn: Loss | None = None,
         damping_strategy: DampingStrategy | None = None,
-        jacobian_max_num_rows: int | None = None,
-        use_vmap: bool = True,
         learning_rate: float = 1.0,
         attempts_per_step: int = 10,
         solve_method: Literal['qr', 'cholesky', 'solve'] = 'qr',
+        param_selection_strategy: ParamSelectionStrategy | None = None,
+        use_vmap: bool = True,
+        jacobian_max_num_rows: int | None = None,
     ) -> None:
         """Initializes `LevenbergMarquardtModule` instance.
 
@@ -61,18 +63,6 @@ class LevenbergMarquardtModule(TrainingModule):
                 Defaults to `MSELoss()`.
             damping_strategy: Damping strategy to use during training.
                 Defaults to `StandardDampingStrategy`.
-
-            jacobian_max_num_rows: If set, and the number of residuals exceeds the
-                number of variables (overdetermined case), the Jacobian is computed in
-                smaller input batches and then accumulated to form the full Gauss-Newton
-                Hessian matrix approximation. This approach reduces memory usage and
-                improves computational efficiency. Each Jacobian matrix will contain at
-                most `jacobian_max_num_rows` rows.
-            use_vmap: Specifies whether to use `torch.vmap` for Jacobian computation.
-                Enabling `vmap` is generally the preferred choice as it is faster
-                and requires less memory, especially for medium to large models.
-                For very small models or simple cases, computing the Jacobian
-                without `vmap` might be marginally more efficient. Defaults to `True`.
             learning_rate: Specifies the step size for updating the model parameters.
                 The update is performed using the formula `w = w - lr * updates`,
                 where `updates` are calculated by the Levenberg-Marquardt algorithm.
@@ -89,6 +79,20 @@ class LevenbergMarquardtModule(TrainingModule):
                 - 'qr': QR decomposition (robust, slower).
                 - 'cholesky': Cholesky decomposition (fast, less stable).
                 - 'solve': Direct solve (balanced speed and robustness).
+            param_selection_strategy: A `ParamSelectionStrategy` instance defining how
+                subsets of parameters are chosen each training_step. If None, all
+                parameters are used.
+            use_vmap: Specifies whether to use `torch.vmap` for Jacobian computation.
+                Enabling `vmap` is generally the preferred choice as it is faster
+                and requires less memory, especially for medium to large models.
+                For very small models or simple cases, computing the Jacobian
+                without `vmap` might be marginally more efficient. Defaults to `True`.
+            jacobian_max_num_rows: If set, and the number of residuals exceeds the
+                number of variables (overdetermined case), the Jacobian is computed in
+                smaller input batches and then accumulated to form the full Gauss-Newton
+                Hessian matrix approximation. This approach reduces memory usage and
+                improves computational efficiency. Each Jacobian matrix will contain at
+                most `jacobian_max_num_rows` rows.
         """
         self._model = model
 
@@ -96,12 +100,12 @@ class LevenbergMarquardtModule(TrainingModule):
         self.loss_fn = loss_fn or MSELoss()
         self.damping_strategy = damping_strategy or StandardDampingStrategy()
 
-        # Hyperparameters
-        self.jacobian_max_num_rows = jacobian_max_num_rows
-        self.use_vmap = use_vmap
         self.learning_rate = learning_rate
         self.attempts_per_step = attempts_per_step
         self.solve_method = solve_method
+        self.param_selection_strategy = param_selection_strategy
+        self.use_vmap = use_vmap
+        self.jacobian_max_num_rows = jacobian_max_num_rows
 
         # Initialize damping factor
         self.damping_factor = self.damping_strategy.get_starting_value()
@@ -110,7 +114,10 @@ class LevenbergMarquardtModule(TrainingModule):
         self._params = {
             n: p for n, p in self._model.named_parameters() if p.requires_grad
         }
-        self._num_parameters = sum(p.numel() for p in self._params.values())
+        self._num_params = sum(p.numel() for p in self._params.values())
+
+        # Precompute splits for flat_params
+        self._splits = [param.numel() for param in self._params.values()]
 
         # Flatten all trainable parameters into a single tensor
         self.flat_params = torch.cat(
@@ -226,14 +233,14 @@ class LevenbergMarquardtModule(TrainingModule):
         self,
         inputs: Tensor,
         targets: Tensor,
+        param_indices: torch.Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Computes the Jacobian of the residuals with respect to model parameters.
-
-        This method uses `torch.func.jacrev` to compute the Jacobian efficiently.
 
         Args:
             inputs: Input tensor of shape `(batch_size, input_dim, ...)`.
             targets: Target tensor of shape `(batch_size, target_dim, ...)`.
+            param_indices: Indices of selected parameters if using a subset, else None.
 
         Returns:
             tuple: A tuple containing:
@@ -243,58 +250,56 @@ class LevenbergMarquardtModule(TrainingModule):
         """
         buffers = dict(self._model.named_buffers())
 
-        def compute_residuals_per_sample(
+        def compute_residuals(
             flat_params: Tensor, input: Tensor, target: Tensor
         ) -> Tensor:
-            input = input.unsqueeze(0)
-            target = target.unsqueeze(0)
+            if param_indices is not None:
+                full_params = self.flat_params.clone()
+                full_params[param_indices] = flat_params
+            else:
+                full_params = flat_params
 
-            # Reconstruct trainable parameter dictionary from flat_params
-            params = {}
-            start = 0
-            for n, p in self._params.items():
-                size = p.numel()
-                params[n] = flat_params[start : start + size].view_as(p)
-                start += size
+            # Split flat_params into tensors matching the shapes of the model parameters
+            param_list = torch.split(full_params, self._splits)
 
-            # Merge model buffers into the parameter dictionary
-            params_and_buffers = params | buffers
+            # Map the split tensors back to their names
+            params = {
+                name: tensor.view_as(param)
+                for (name, param), tensor in zip(self._params.items(), param_list)
+            }
 
-            # Compute outputs and residuals
-            output = functional_call(self._model, params_and_buffers, input)
-            residual = self.loss_fn.residuals(target, output).view(-1)
-            return residual
-
-        def compute_residuals(params) -> Tensor:
-            params_and_buffers = params | buffers
-            outputs = functional_call(self._model, params_and_buffers, inputs)
-            residuals = self.loss_fn.residuals(targets, outputs).view(-1)
-            return residuals
+            params_and_buffers = {**params, **buffers}
+            outputs = functional_call(self._model, params_and_buffers, input)
+            return self.loss_fn.residuals(target, outputs).view(-1)
 
         # Compute outputs and residuals for the full batch
         outputs = self.forward(inputs)
         residuals = self.loss_fn.residuals(targets, outputs).view(-1, 1)
 
-        if self.use_vmap:
-            # Compute the Jacobian with vmap
-            jacobian_func = jacrev(compute_residuals_per_sample)
-            jacobian_func_vmap = vmap(jacobian_func, in_dims=(None, 0, 0))
-            jacobians = jacobian_func_vmap(self.flat_params, inputs, targets)
-            assert isinstance(jacobians, Tensor)
-            J = jacobians.reshape(-1, self._num_parameters)
-        else:
-            # Compute the Jacobian without vmap
-            num_residuals = residuals.numel()
-            jacobian_func = jacrev(compute_residuals)
-            jacobians = jacobian_func(self._params)
-            assert isinstance(jacobians, dict)
-            jacobians = [j.reshape(num_residuals, -1) for j in jacobians.values()]
-            J = torch.cat(jacobians, dim=1)
+        # Adjust flat_params to focus on the selected subset, if provided
+        param_subset = (
+            self.flat_params
+            if param_indices is None
+            else self.flat_params[param_indices]
+        )
 
-        return J, residuals, outputs
+        jacobians: Tensor
+        if self.use_vmap:
+            # Compute per-sample Jacobian with vmap and jacrev
+            jacobian_func = jacrev(compute_residuals)
+            jacobians = vmap(jacobian_func, in_dims=(None, 0, 0))(
+                param_subset, inputs.unsqueeze(1), targets.unsqueeze(1)
+            )
+            jacobians = jacobians.squeeze(1)
+        else:
+            # Compute per-batch Jacobian with jacrev
+            jacobian_func = jacrev(lambda p: compute_residuals(p, inputs, targets))
+            jacobians = jacobian_func(param_subset)  # type: ignore
+
+        return jacobians, residuals, outputs
 
     def _sliced_gauss_newton(
-        self, inputs: Tensor, targets: Tensor
+        self, inputs: Tensor, targets: Tensor, param_indices: torch.Tensor | None
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Gauss-Newton approximation for overdetermined systems using slicing.
 
@@ -307,6 +312,7 @@ class LevenbergMarquardtModule(TrainingModule):
         Args:
             inputs: Input tensor of shape `(batch_size, input_dim, ...)`.
             targets: Target tensor of shape `(batch_size, output_dim, ...)`.
+            param_indices: Indices of selected parameters if using a subset, else None.
 
         Returns:
             tuple:
@@ -324,14 +330,18 @@ class LevenbergMarquardtModule(TrainingModule):
         num_slices = batch_size // slice_size
         remainder = batch_size % slice_size
 
+        num_params = (
+            param_indices.numel() if param_indices is not None else self._num_params
+        )
+
         JJ = torch.zeros(
-            (self._num_parameters, self._num_parameters),
+            (num_params, num_params),
             dtype=inputs.dtype,
             device=inputs.device,
         )
 
         rhs = torch.zeros(
-            (self._num_parameters, 1),
+            (num_params, 1),
             dtype=inputs.dtype,
             device=inputs.device,
         )
@@ -344,7 +354,9 @@ class LevenbergMarquardtModule(TrainingModule):
             _inputs = inputs[idx_start:idx_end]
             _targets = targets[idx_start:idx_end]
 
-            J, residuals, _outputs = self._compute_jacobian(_inputs, _targets)
+            J, residuals, _outputs = self._compute_jacobian(
+                _inputs, _targets, param_indices
+            )
             outputs_list.append(_outputs)
 
             JJ += J.t().matmul(J)  # JJ = JJ + J' * J
@@ -354,7 +366,9 @@ class LevenbergMarquardtModule(TrainingModule):
             _inputs = inputs[num_slices * slice_size :]
             _targets = targets[num_slices * slice_size :]
 
-            J, residuals, _outputs = self._compute_jacobian(_inputs, _targets)
+            J, residuals, _outputs = self._compute_jacobian(
+                _inputs, _targets, param_indices
+            )
             outputs_list.append(_outputs)
 
             JJ += J.t().matmul(J)  # JJ = JJ + J' * J
@@ -386,25 +400,31 @@ class LevenbergMarquardtModule(TrainingModule):
             # Initialize during the first train step
             self._num_outputs = self._compute_num_outputs(inputs, targets)
 
+        num_params = self._num_params
+        param_indices = None
+        if self.param_selection_strategy is not None:
+            param_indices = self.param_selection_strategy.select_parameters()
+
         batch_size = inputs.shape[0]
         num_residuals = batch_size * self._num_outputs
-        overdetermined = num_residuals >= self._num_parameters
+        overdetermined = num_residuals >= num_params
 
-        if overdetermined:
-            if self.jacobian_max_num_rows:
-                # overdetermined reduced memory sliced JJ computation
-                JJ, rhs, outputs = self._sliced_gauss_newton(inputs, targets)
-            else:
-                # overdetermined
-                J, residuals, outputs = self._compute_jacobian(inputs, targets)
-                JJ = J.t().matmul(J)  # JJ = J' * J
-                rhs = J.t().matmul(residuals)  # rhs = J' * residuals
-                J = None
+        if overdetermined and self.jacobian_max_num_rows is not None:
+            # overdetermined reduced memory sliced JJ computation
+            JJ, rhs, outputs = self._sliced_gauss_newton(inputs, targets, param_indices)
+            J = None
         else:
-            # underdetermined
-            J, residuals, outputs = self._compute_jacobian(inputs, targets)
-            JJ = J.matmul(J.t())  # JJ = J * J'
-            rhs = residuals  # rhs = residuals
+            J, residuals, outputs = self._compute_jacobian(
+                inputs, targets, param_indices
+            )
+            if overdetermined:
+                # overdetermined
+                JJ = J.t() @ J  # JJ = J' * J
+                rhs = J.t() @ residuals  # rhs = J' * residuals
+            else:
+                # underdetermined
+                JJ = J @ J.t()  # JJ = J * J'
+                rhs = residuals  # rhs = residuals
 
         # Normalize for numerical stability
         normalization_factor = 1.0 / batch_size
@@ -434,6 +454,15 @@ class LevenbergMarquardtModule(TrainingModule):
                 if not overdetermined:
                     assert J is not None
                     updates = J.t().matmul(updates)
+
+                if param_indices is not None:
+                    full_updates = torch.zeros(
+                        self._num_params,
+                        device=updates.device,
+                        dtype=updates.dtype,
+                    )
+                    full_updates[param_indices] = updates.view(-1)
+                    updates = full_updates
 
                 # Check if updates are finite
                 if torch.all(torch.isfinite(updates)):
