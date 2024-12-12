@@ -1,6 +1,8 @@
 # PyTorch Levenberg-Marquardt
 
 [![PyPI](https://img.shields.io/pypi/v/torch-levenberg-marquardt)](https://pypi.org/project/torch-levenberg-marquardt/)
+[![PyPI Downloads](https://img.shields.io/pypi/dm/torch-levenberg-marquardt?label=PyPI%20downloads)](https://pypi.org/project/torch-levenberg-marquardt/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/fabiodimarco/torch-levenberg-marquardt/blob/main/examples/torch_levenberg_marquardt.ipynb)
 
 A PyTorch implementation of the **Levenberg-Marquardt (LM)** optimization algorithm, supporting **mini-batch training** for both **regression** and **classification** problems. It leverages GPU acceleration and offers an extensible framework, supporting diverse loss functions and customizable damping strategies.
