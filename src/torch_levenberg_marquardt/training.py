@@ -108,7 +108,6 @@ class LevenbergMarquardtModule(TrainingModule):
         self.jacobian_max_num_rows = jacobian_max_num_rows
 
         # Initialize damping factor
-        self.damping_factor = self.damping_strategy.get_starting_value()
 
         # Extract trainable parameters
         self._params = {
@@ -157,7 +156,7 @@ class LevenbergMarquardtModule(TrainingModule):
     def reset(self) -> None:
         """Resets internal state, including the damping factor and outputs."""
         self._num_outputs = None
-        self.damping_factor = self.damping_strategy.get_starting_value()
+        self.damping_strategy.reset()
 
     def forward(self, inputs: Tensor) -> Tensor:
         """Performs a forward pass using the current model parameters."""
@@ -436,7 +435,7 @@ class LevenbergMarquardtModule(TrainingModule):
 
         stop_training = False
         attempt = 0
-        damping_factor = self.damping_strategy.init_step(self.damping_factor, loss)
+        self.damping_strategy.initialize_step(loss)
 
         while True:  # Infinite loop, break conditions inside
             params_updated = False
@@ -444,7 +443,7 @@ class LevenbergMarquardtModule(TrainingModule):
             # Try to update the parameters
             try:
                 # Apply damping to the Gauss-Newton Hessian approximation
-                JJ_damped = self.damping_strategy.apply(damping_factor, JJ)
+                JJ_damped = self.damping_strategy.apply(JJ)
 
                 # Compute the updates:
                 # - Overdetermined: updates = (J' * J + damping)^-1 * J'*residuals
@@ -483,9 +482,7 @@ class LevenbergMarquardtModule(TrainingModule):
                     if new_loss < loss:
                         # Accept the new model parameters and backup them
                         loss = new_loss
-                        damping_factor = self.damping_strategy.decrease(
-                            damping_factor, loss
-                        )
+                        self.damping_strategy.on_successful_update(loss)
                         self.backup_parameters()
                         break
 
@@ -493,22 +490,20 @@ class LevenbergMarquardtModule(TrainingModule):
                     self.restore_parameters()
 
                 # Adjust the damping factor for the next attempt
-                damping_factor = self.damping_strategy.increase(damping_factor, loss)
+                self.damping_strategy.on_unsuccessful_update(loss)
+
+                # Check if should stop attempts and just take the update
+                stop_attempts = self.damping_strategy.stop_attempts(loss)
 
                 # Check if training should stop
-                stop_training = self.damping_strategy.stop_training(
-                    damping_factor, loss
-                )
-                if stop_training:
+                stop_training = self.damping_strategy.stop_training(loss)
+                if stop_training or stop_attempts:
                     break
             else:
                 break
 
-        # Update the damping factor for the next train_step
-        self.damping_factor = damping_factor
-
         logs = {
-            'damping_factor': damping_factor,
+            'damping': self.damping_strategy.get_current_damping(),
             'attempts': attempt,
         }
 

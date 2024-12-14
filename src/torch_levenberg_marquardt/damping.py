@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Literal
 
 import torch
 from torch import Tensor
@@ -8,32 +9,42 @@ class DampingStrategy(ABC):
     """Base class for damping strategies in Levenberg-Marquardt optimization."""
 
     @abstractmethod
-    def get_starting_value(self) -> Tensor:
-        """Returns the initial damping factor."""
+    def reset(self) -> None:
+        """Resets any state to its initial value."""
         pass
 
     @abstractmethod
-    def init_step(self, damping_factor: Tensor, loss: Tensor) -> Tensor:
-        """Initializes the damping factor for a new training step."""
+    def get_current_damping(self) -> Tensor:
+        """Retrieves the current damping factor."""
         pass
 
     @abstractmethod
-    def decrease(self, damping_factor: Tensor, loss: Tensor) -> Tensor:
-        """Decreases the damping factor after a successful update."""
+    def initialize_step(self, loss: Tensor) -> None:
+        """Initializes any state before a training step."""
         pass
 
     @abstractmethod
-    def increase(self, damping_factor: Tensor, loss: Tensor) -> Tensor:
-        """Increases the damping factor after an unsuccessful update."""
+    def on_successful_update(self, loss: Tensor) -> None:
+        """Adjust the damping factor after a successful update."""
         pass
 
     @abstractmethod
-    def stop_training(self, damping_factor: Tensor, loss: Tensor) -> bool:
+    def on_unsuccessful_update(self, loss: Tensor) -> None:
+        """Adjust the damping factor after an unsuccessful update."""
+        pass
+
+    @abstractmethod
+    def stop_attempts(self, loss: Tensor) -> bool:
+        """Determines if the update should be accepted with no further attempts"""
+        pass
+
+    @abstractmethod
+    def stop_training(self, loss: Tensor) -> bool:
         """Checks if training should stop based on the damping factor."""
         pass
 
     @abstractmethod
-    def apply(self, damping_factor: Tensor, JJ: Tensor) -> Tensor:
+    def apply(self, JJ: Tensor) -> Tensor:
         """Applies damping to the Gauss-Newton Hessian approximation."""
         pass
 
@@ -52,8 +63,9 @@ class StandardDampingStrategy(DampingStrategy):
         inc_factor: float = 10.0,
         min_value: float = 1e-10,
         max_value: float = 1e10,
-        adaptive_scaling: bool = False,
-        fletcher: bool = False,
+        damping_mode: Literal['standard', 'adaptive', 'fletcher'] = 'standard',
+        conditional_stopping: bool = True,
+        auto_reset: bool = False,
     ) -> None:
         """Initializes `StandardDampingStrategy` instance.
 
@@ -68,95 +80,100 @@ class StandardDampingStrategy(DampingStrategy):
                 the cost of slower convergence.
             max_value: Used as an upper bound for the damping_factor, and as a condition
                 to stop the training process.
-            adaptive_scaling: Scales the damping_factor adaptively multiplying it
-                with max(diagonal(JJ)).
-            fletcher: Replaces the identity matrix with the diagonal of the
-                Gauss-Newton Hessian approximation, so that there is larger movement
-                along the directions where the gradient is smaller. This avoids slow
-                convergence in the direction of small gradient.
+            damping_mode: Specifies the damping mode. Options are:
+                - 'standard': Standard damping using the identity matrix (default).
+                - 'adaptive': Apply adaptive scaling with max(diagonal(JJ)).
+                - 'fletcher': Use Fletcher's modification for damping.
+            conditional_stopping: If True, stops training based on damping conditions.
+            auto_reset: If True, resets the damping factor when `stop_attempts` is True.
         """
         self.starting_value = torch.tensor(starting_value)
         self.dec_factor = torch.tensor(dec_factor)
         self.inc_factor = torch.tensor(inc_factor)
         self.min_value = torch.tensor(min_value)
         self.max_value = torch.tensor(max_value)
-        self.adaptive_scaling = adaptive_scaling
-        self.fletcher = fletcher
+        self.damping_mode = damping_mode
+        self.conditional_stopping = conditional_stopping
+        self.auto_reset = auto_reset
 
-    def get_starting_value(self) -> Tensor:
-        """Gets the initial damping factor.
+        self.damping_factor = torch.tensor(starting_value)
 
-        Returns:
-            Tensor: A scalar tensor representing the initial damping factor.
-        """
-        return self.starting_value
+    def reset(self) -> None:
+        """Resets the damping factor to the starting value."""
+        self.damping_factor = self.starting_value
 
-    def init_step(self, damping_factor: Tensor, loss: Tensor) -> Tensor:
-        """Initializes the damping factor for a new training step.
+    def get_current_damping(self) -> Tensor:
+        """Retrieves the current damping factor."""
+        return self.damping_factor
 
-        Args:
-            damping_factor: The current damping factor.
-            loss: The current loss value.
+    def initialize_step(self, loss: Tensor) -> None:
+        """Initializes any state before a training step."""
+        pass
 
-        Returns:
-            Tensor: The initialized damping factor, identical to the input by default.
-        """
-        return damping_factor
-
-    def decrease(self, damping_factor: Tensor, loss: Tensor) -> Tensor:
+    def on_successful_update(self, loss: Tensor) -> None:
         """Decreases the damping factor.
 
         Args:
-            damping_factor: The current damping factor.
             loss: The current loss value.
 
         Returns:
             The decreased damping factor.
         """
-        return torch.max(damping_factor * self.dec_factor, self.min_value)
+        self.damping_factor = torch.max(
+            self.damping_factor * self.dec_factor, self.min_value
+        )
 
-    def increase(self, damping_factor: Tensor, loss: Tensor) -> Tensor:
+    def on_unsuccessful_update(self, loss: Tensor) -> None:
         """Increases the damping factor.
 
         Args:
-            damping_factor: The current damping factor.
             loss: The current loss value.
 
         Returns:
             The increased damping factor.
         """
-        return torch.min(damping_factor * self.inc_factor, self.max_value)
+        self.damping_factor = torch.min(
+            self.damping_factor * self.inc_factor, self.max_value
+        )
 
-    def stop_training(self, damping_factor: Tensor, loss: Tensor) -> bool:
+    def stop_attempts(self, loss: Tensor) -> bool:
+        """Determines if further attempts should be stopped and performs auto-reset."""
+        should_stop = bool((self.damping_factor >= self.max_value).item())
+        if self.auto_reset and should_stop:
+            self.reset()
+        return should_stop
+
+    def stop_training(self, loss: Tensor) -> bool:
         """Determines whether to stop training based on the damping factor.
 
         Args:
-            damping_factor: The current damping factor.
             loss: The current loss value.
 
         Returns:
             True if the damping factor exceeds the maximum value, False otherwise.
         """
-        return bool((damping_factor >= self.max_value).item())
+        return self.stop_attempts(loss) and self.conditional_stopping
 
-    def apply(self, damping_factor: Tensor, JJ: Tensor) -> Tensor:
+    def apply(self, JJ: Tensor) -> Tensor:
         """Applies the damping to the Gauss-Newton Hessian approximation.
 
         Args:
-            damping_factor: The current damping factor.
             JJ: The Gauss-Newton Hessian approximation matrix.
 
         Returns:
             The damped Hessian matrix.
         """
-        if self.fletcher:
+        if self.damping_mode == 'standard':
+            damping_matrix = torch.eye(JJ.shape[0], dtype=JJ.dtype, device=JJ.device)
+        elif self.damping_mode == 'adaptive':
+            damping_matrix = torch.eye(JJ.shape[0], dtype=JJ.dtype, device=JJ.device)
+            damping_matrix = damping_matrix * torch.max(torch.abs(torch.diagonal(JJ)))
+        elif self.damping_mode == 'fletcher':
             damping_matrix = torch.diag(torch.diagonal(JJ))
         else:
-            damping_matrix = torch.eye(JJ.shape[0], dtype=JJ.dtype, device=JJ.device)
+            raise ValueError(
+                f"Invalid damping_mode '{self.damping_mode}'. Expected one of "
+                f"'standard', 'adaptive', or 'fletcher'."
+            )
 
-        scaler = torch.tensor(1.0, dtype=JJ.dtype, device=JJ.device)
-        if self.adaptive_scaling:
-            scaler = torch.max(torch.abs(torch.diagonal(JJ)))
-
-        damping_matrix = scaler * damping_factor * damping_matrix
-        return JJ + damping_matrix
+        return JJ + self.damping_factor * damping_matrix
