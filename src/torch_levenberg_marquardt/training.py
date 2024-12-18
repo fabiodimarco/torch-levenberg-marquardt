@@ -139,7 +139,7 @@ class LevenbergMarquardtModule(TrainingModule):
             **dict(self._model.named_buffers()),
         }
 
-        self._num_outputs = None
+        self._num_residuals_per_batch = None
 
     @torch.no_grad()
     def backup_parameters(self) -> None:
@@ -154,7 +154,7 @@ class LevenbergMarquardtModule(TrainingModule):
     @torch.no_grad()
     def reset(self) -> None:
         """Resets internal state, including the damping factor and outputs."""
-        self._num_outputs = None
+        self._num_residuals_per_batch = None
         self.damping_strategy.reset()
 
     def forward(self, inputs: Tensor) -> Tensor:
@@ -162,7 +162,7 @@ class LevenbergMarquardtModule(TrainingModule):
         return functional_call(self._model, self._params_and_buffers, inputs)
 
     @torch.no_grad()
-    def _compute_num_outputs(self, inputs: Tensor, targets: Tensor) -> int:
+    def _compute_num_residuals_per_batch(self, inputs: Tensor, targets: Tensor) -> int:
         """Computes the number of outputs from the model.
 
         Args:
@@ -328,7 +328,7 @@ class LevenbergMarquardtModule(TrainingModule):
                 - outputs: `(batch_size, output_dim, ...)`
         """
         assert self.max_batch_size is not None
-        assert self._num_outputs is not None
+        assert self._num_residuals_per_batch is not None
 
         batch_size = inputs.shape[0]
         num_params = (
@@ -385,7 +385,7 @@ class LevenbergMarquardtModule(TrainingModule):
                 - outputs: `(batch_size, output_dim, ...)`
         """
         assert self.max_batch_size is not None
-        assert self._num_outputs is not None
+        assert self._num_residuals_per_batch is not None
 
         batch_size = inputs.shape[0]
 
@@ -436,9 +436,11 @@ class LevenbergMarquardtModule(TrainingModule):
                 - stop_training: Whether training should stop.
                 - logs: Additional metadata (e.g., damping factor, attempts).
         """
-        if self._num_outputs is None:
+        if self._num_residuals_per_batch is None:
             # Initialize during the first train step
-            self._num_outputs = self._compute_num_outputs(inputs, targets)
+            self._num_residuals_per_batch = self._compute_num_residuals_per_batch(
+                inputs, targets
+            )
 
         num_params = self._num_params
 
@@ -448,7 +450,7 @@ class LevenbergMarquardtModule(TrainingModule):
             num_params = param_indices.numel()
 
         batch_size = inputs.shape[0]
-        num_residuals = batch_size * self._num_outputs
+        num_residuals = batch_size * self._num_residuals_per_batch
         overdetermined = num_residuals >= num_params
 
         if self.max_batch_size is not None:
