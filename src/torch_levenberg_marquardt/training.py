@@ -53,7 +53,7 @@ class LevenbergMarquardtModule(TrainingModule):
         solve_method: Literal['qr', 'cholesky', 'solve'] = 'qr',
         param_selection_strategy: ParamSelectionStrategy | None = None,
         use_vmap: bool = True,
-        jacobian_max_num_rows: int | None = None,
+        max_batch_size: int | None = None,
     ) -> None:
         """Initializes `LevenbergMarquardtModule` instance.
 
@@ -87,12 +87,13 @@ class LevenbergMarquardtModule(TrainingModule):
                 and requires less memory, especially for medium to large models.
                 For very small models or simple cases, computing the Jacobian
                 without `vmap` might be marginally more efficient. Defaults to `True`.
-            jacobian_max_num_rows: If set, and the number of residuals exceeds the
-                number of variables (overdetermined case), the Jacobian is computed in
-                smaller input batches and then accumulated to form the full Gauss-Newton
-                Hessian matrix approximation. This approach reduces memory usage and
-                improves computational efficiency. Each Jacobian matrix will contain at
-                most `jacobian_max_num_rows` rows.
+            max_batch_size: If set, the input batch is divided into smaller sub-batches
+                of this size when computing the Jacobian and forming the Gauss-Newton
+                approximations. Each sub-batch processes a portion of the input data at
+                a time, allowing the Hessian approximation and the RHS vector to be
+                constructed incrementally. This reduces peak memory usage but can limit
+                parallelism, as the computations are partially serialized rather than
+                fully utilizing hardware resources for parallel computation.
         """
         self._model = model
 
@@ -105,7 +106,7 @@ class LevenbergMarquardtModule(TrainingModule):
         self.solve_method = solve_method
         self.param_selection_strategy = param_selection_strategy
         self.use_vmap = use_vmap
-        self.jacobian_max_num_rows = jacobian_max_num_rows
+        self.max_batch_size = max_batch_size
 
         # Extract trainable parameters
         self._params = {
@@ -225,14 +226,14 @@ class LevenbergMarquardtModule(TrainingModule):
         Args:
             updates: The computed parameter updates.
         """
-        self.flat_params.add_(-self.learning_rate * updates.view(-1))
+        self.flat_params.add_(-self.learning_rate * updates)
 
     @torch.no_grad()
     def _compute_jacobian(
         self,
         inputs: Tensor,
         targets: Tensor,
-        param_indices: torch.Tensor | None,
+        param_indices: Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Computes the Jacobian of the residuals with respect to model parameters.
 
@@ -302,16 +303,18 @@ class LevenbergMarquardtModule(TrainingModule):
         return jacobians, residuals, outputs
 
     @torch.no_grad()
-    def _sliced_gauss_newton(
-        self, inputs: Tensor, targets: Tensor, param_indices: torch.Tensor | None
+    def _sliced_gauss_newton_overdetermined(
+        self,
+        inputs: Tensor,
+        targets: Tensor,
+        param_indices: Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Gauss-Newton approximation for overdetermined systems using slicing.
 
         This method handles large overdetermined systems by dividing the input into
         smaller slices. For each slice, the Jacobian matrix is computed and used to
         incrementally build the full Gauss-Newton Hessian approximation and the
-        right-hand side (RHS) vector. This approach reduces memory usage while
-        maintaining computational accuracy.
+        right-hand side (RHS) vector.
 
         Args:
             inputs: Input tensor of shape `(batch_size, input_dim, ...)`.
@@ -320,67 +323,99 @@ class LevenbergMarquardtModule(TrainingModule):
 
         Returns:
             tuple:
-                - JJ: The accumulated Gauss-Newton Hessian approximation of shape
-                    `(num_parameters, num_parameters)`.
-                - rhs: The right-hand side vector of shape `(num_parameters, 1)`.
-                - outputs: The concatenated model outputs of shape
-                    `(batch_size, output_dim, ...)`.
+                - JJ: `(num_parameters, num_parameters) = J' * J`
+                - rhs: `(num_parameters, 1) = J' * residuals`.
+                - outputs: `(batch_size, output_dim, ...)`
         """
-        assert self.jacobian_max_num_rows is not None
+        assert self.max_batch_size is not None
         assert self._num_outputs is not None
 
-        slice_size = self.jacobian_max_num_rows // self._num_outputs
         batch_size = inputs.shape[0]
-        num_slices = batch_size // slice_size
-        remainder = batch_size % slice_size
-
         num_params = (
             param_indices.numel() if param_indices is not None else self._num_params
         )
 
         JJ = torch.zeros(
-            (num_params, num_params),
-            dtype=inputs.dtype,
-            device=inputs.device,
+            (num_params, num_params), dtype=inputs.dtype, device=inputs.device
         )
+        rhs = torch.zeros((num_params, 1), dtype=inputs.dtype, device=inputs.device)
 
-        rhs = torch.zeros(
-            (num_params, 1),
-            dtype=inputs.dtype,
-            device=inputs.device,
-        )
+        outputs_slices = []
 
-        outputs_list = []
+        for start in range(0, batch_size, self.max_batch_size):
+            end = min(start + self.max_batch_size, batch_size)
+            inputs_slice = inputs[start:end]
+            targets_slice = targets[start:end]
 
-        for i in range(num_slices):
-            idx_start = i * slice_size
-            idx_end = (i + 1) * slice_size
-            _inputs = inputs[idx_start:idx_end]
-            _targets = targets[idx_start:idx_end]
-
-            J, residuals, _outputs = self._compute_jacobian(
-                _inputs, _targets, param_indices
+            J_slice, residuals_slice, outputs_slice = self._compute_jacobian(
+                inputs_slice, targets_slice, param_indices
             )
-            outputs_list.append(_outputs)
+            outputs_slices.append(outputs_slice)
 
-            JJ += J.t().matmul(J)  # JJ = JJ + J' * J
-            rhs += J.t().matmul(residuals)  # rhs = rhs + J' * residuals
+            JJ += J_slice.t().matmul(J_slice)
+            rhs += J_slice.t().matmul(residuals_slice)
 
-        if remainder > 0:
-            _inputs = inputs[num_slices * slice_size :]
-            _targets = targets[num_slices * slice_size :]
-
-            J, residuals, _outputs = self._compute_jacobian(
-                _inputs, _targets, param_indices
-            )
-            outputs_list.append(_outputs)
-
-            JJ += J.t().matmul(J)  # JJ = JJ + J' * J
-            rhs += J.t().matmul(residuals)  # rhs = rhs + J' * residuals
-
-        outputs = torch.cat(outputs_list, dim=0)
+        outputs = torch.cat(outputs_slices, dim=0)
 
         return JJ, rhs, outputs
+
+    @torch.no_grad()
+    def _sliced_gauss_newton_underdetermined(
+        self,
+        inputs: Tensor,
+        targets: Tensor,
+        param_indices: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Gauss-Newton approximation for underdetermined systems using slicing.
+
+        This method handles large underdetermined systems by dividing the input into
+        smaller slices. For each slice, it computes the local Jacobian and residuals,
+        concatenating them into a full J and residuals.
+
+        Args:
+            inputs: Input tensor `(batch_size, input_dim, ...)`.
+            targets: Target tensor `(batch_size, output_dim, ...)`.
+            param_indices: Indices of selected parameters if using a subset, else None.
+
+        Returns:
+            tuple:
+                - J: Full Jacobian `(num_residuals, num_parameters)`
+                - JJ: `(num_residuals, num_residuals) = J * J'`
+                - rhs: `(num_residuals, 1) = residuals`
+                - outputs: `(batch_size, output_dim, ...)`
+        """
+        assert self.max_batch_size is not None
+        assert self._num_outputs is not None
+
+        batch_size = inputs.shape[0]
+
+        J_slices = []
+        residuals_slices = []
+        outputs_slices = []
+
+        for start in range(0, batch_size, self.max_batch_size):
+            end = min(start + self.max_batch_size, batch_size)
+            inputs_slice = inputs[start:end]
+            targets_slice = targets[start:end]
+
+            J_slice, residuals_slice, outputs_slice = self._compute_jacobian(
+                inputs_slice, targets_slice, param_indices
+            )
+
+            J_slices.append(J_slice)
+            residuals_slices.append(residuals_slice)
+            outputs_slices.append(outputs_slice)
+
+        # Concatenate all slices to form the full J, residuals, and outputs
+        J = torch.cat(J_slices, dim=0)
+        residuals = torch.cat(residuals_slices, dim=0)
+        outputs = torch.cat(outputs_slices, dim=0)
+
+        # Compute JJ and rhs as in the non-sliced scenario for underdetermined case
+        JJ = J @ J.t()  # JJ = J * J'
+        rhs = residuals  # rhs = residuals
+
+        return J, JJ, rhs, outputs
 
     @torch.no_grad()
     def training_step(
@@ -405,19 +440,28 @@ class LevenbergMarquardtModule(TrainingModule):
             # Initialize during the first train step
             self._num_outputs = self._compute_num_outputs(inputs, targets)
 
+        num_params = self._num_params
+
         param_indices = None
         if self.param_selection_strategy is not None:
             param_indices = self.param_selection_strategy.select_parameters()
+            num_params = param_indices.numel()
 
         batch_size = inputs.shape[0]
         num_residuals = batch_size * self._num_outputs
-        num_params = self._num_params
         overdetermined = num_residuals >= num_params
 
-        if overdetermined and self.jacobian_max_num_rows is not None:
-            # overdetermined reduced memory sliced JJ computation
-            JJ, rhs, outputs = self._sliced_gauss_newton(inputs, targets, param_indices)
-            J = None
+        if self.max_batch_size is not None:
+            # reduced memory sliced computation
+            if overdetermined:
+                JJ, rhs, outputs = self._sliced_gauss_newton_overdetermined(
+                    inputs, targets, param_indices
+                )
+                J = None
+            else:
+                J, JJ, rhs, outputs = self._sliced_gauss_newton_underdetermined(
+                    inputs, targets, param_indices
+                )
         else:
             J, residuals, outputs = self._compute_jacobian(
                 inputs, targets, param_indices
@@ -460,13 +504,15 @@ class LevenbergMarquardtModule(TrainingModule):
                     assert J is not None
                     updates = J.t().matmul(updates)
 
+                updates = updates.view(-1)
+
                 if param_indices is not None:
                     full_updates = torch.zeros(
                         self._num_params,
                         device=updates.device,
                         dtype=updates.dtype,
                     )
-                    full_updates[param_indices] = updates.view(-1)
+                    full_updates[param_indices] = updates
                     updates = full_updates
 
                 # Check if updates are finite
