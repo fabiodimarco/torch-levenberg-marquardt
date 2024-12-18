@@ -107,8 +107,6 @@ class LevenbergMarquardtModule(TrainingModule):
         self.use_vmap = use_vmap
         self.jacobian_max_num_rows = jacobian_max_num_rows
 
-        # Initialize damping factor
-
         # Extract trainable parameters
         self._params = {
             n: p for n, p in self._model.named_parameters() if p.requires_grad
@@ -192,6 +190,7 @@ class LevenbergMarquardtModule(TrainingModule):
 
         return residuals.numel()
 
+    @torch.no_grad()
     def _solve(self, matrix: Tensor, rhs: Tensor) -> Tensor:
         """Solves the linear system using the specified solver.
 
@@ -228,6 +227,7 @@ class LevenbergMarquardtModule(TrainingModule):
         """
         self.flat_params.add_(-self.learning_rate * updates.view(-1))
 
+    @torch.no_grad()
     def _compute_jacobian(
         self,
         inputs: Tensor,
@@ -269,14 +269,14 @@ class LevenbergMarquardtModule(TrainingModule):
 
             params_and_buffers = {**params, **buffers}
             outputs = functional_call(self._model, params_and_buffers, input)
-            return self.loss_fn.residuals(target, outputs).view(-1)
+            return self.loss_fn.residuals(target, outputs)
 
         # Compute outputs and residuals for the full batch
         outputs = self.forward(inputs)
-        residuals = self.loss_fn.residuals(targets, outputs).view(-1, 1)
+        residuals = self.loss_fn.residuals(targets, outputs)
 
         # Adjust flat_params to focus on the selected subset, if provided
-        param_subset = (
+        flat_params = (
             self.flat_params
             if param_indices is None
             else self.flat_params[param_indices]
@@ -287,16 +287,21 @@ class LevenbergMarquardtModule(TrainingModule):
             # Compute per-sample Jacobian with vmap and jacrev
             jacobian_func = jacrev(compute_residuals)
             jacobians = vmap(jacobian_func, in_dims=(None, 0, 0))(
-                param_subset, inputs.unsqueeze(1), targets.unsqueeze(1)
+                flat_params, inputs.unsqueeze(1), targets.unsqueeze(1)
             )
             jacobians = jacobians.squeeze(1)
         else:
             # Compute per-batch Jacobian with jacrev
             jacobian_func = jacrev(lambda p: compute_residuals(p, inputs, targets))
-            jacobians = jacobian_func(param_subset)  # type: ignore
+            jacobians = jacobian_func(flat_params)  # type: ignore
+
+        # Flatten batches and outputs into a matrix to solve least-squares problems.
+        residuals = residuals.view(-1, 1)
+        jacobians = jacobians.view(-1, flat_params.numel())
 
         return jacobians, residuals, outputs
 
+    @torch.no_grad()
     def _sliced_gauss_newton(
         self, inputs: Tensor, targets: Tensor, param_indices: torch.Tensor | None
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -377,6 +382,7 @@ class LevenbergMarquardtModule(TrainingModule):
 
         return JJ, rhs, outputs
 
+    @torch.no_grad()
     def training_step(
         self,
         inputs: Tensor,
@@ -399,13 +405,13 @@ class LevenbergMarquardtModule(TrainingModule):
             # Initialize during the first train step
             self._num_outputs = self._compute_num_outputs(inputs, targets)
 
-        num_params = self._num_params
         param_indices = None
         if self.param_selection_strategy is not None:
             param_indices = self.param_selection_strategy.select_parameters()
 
         batch_size = inputs.shape[0]
         num_residuals = batch_size * self._num_outputs
+        num_params = self._num_params
         overdetermined = num_residuals >= num_params
 
         if overdetermined and self.jacobian_max_num_rows is not None:
