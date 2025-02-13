@@ -241,11 +241,11 @@ class LevenbergMarquardtModule(TrainingModule):
 
             params_and_buffers = {**params, **buffers}
             outputs = functional_call(self._model, params_and_buffers, input)
-            return self.loss_fn.residuals(target, outputs)
+            return self.loss_fn.residuals(outputs, target)
 
         # Compute outputs and residuals for the full batch
         outputs = self.forward(inputs)
-        residuals = self.loss_fn.residuals(targets, outputs)
+        residuals = self.loss_fn.residuals(outputs, targets)
 
         # Adjust flat_params to focus on the selected subset, if provided
         flat_params = (
@@ -415,7 +415,7 @@ class LevenbergMarquardtModule(TrainingModule):
         if self._batch_size is None:
             # Initialize during the first train step
             outputs = self._model(inputs)
-            residuals = self.loss_fn.residuals(targets, outputs)
+            residuals = self.loss_fn.residuals(outputs, targets)
             self._batch_size = residuals.shape[0]
             self._num_residuals = residuals.numel()
 
@@ -463,7 +463,7 @@ class LevenbergMarquardtModule(TrainingModule):
         rhs *= normalization_factor
 
         # Compute the current loss value
-        loss = self.loss_fn(targets, outputs)
+        loss = self.loss_fn(outputs, targets)
 
         stop_training = False
         attempt = 0
@@ -511,7 +511,7 @@ class LevenbergMarquardtModule(TrainingModule):
                 if params_updated:
                     # Compute the new loss value
                     new_outputs = self.forward(inputs)
-                    new_loss = self.loss_fn(targets, new_outputs)
+                    new_loss = self.loss_fn(new_outputs, targets)
 
                     if new_loss < loss:
                         # Accept the new model parameters and backup them
@@ -613,7 +613,7 @@ class OptimizerModule(TrainingModule):
         """
         # Forward pass
         outputs = self._model(inputs)
-        loss: Tensor = self.loss_fn(targets, outputs)
+        loss: Tensor = self.loss_fn(outputs, targets)
 
         # Backward pass and optimization
         self.optimizer.zero_grad()

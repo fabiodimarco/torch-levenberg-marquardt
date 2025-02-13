@@ -9,13 +9,13 @@ class Loss(torch.nn.Module, ABC):
     """Base class for all loss functions using ABC."""
 
     @abstractmethod
-    def forward(self, y_true: Any, y_pred: Any) -> Tensor:
-        """Computes the loss between `y_true` and `y_pred`."""
+    def forward(self, y_pred: Any, y_true: Any) -> Tensor:
+        """Computes the loss between `y_pred` and `y_true`."""
         pass
 
     @abstractmethod
-    def residuals(self, y_true: Any, y_pred: Any) -> Tensor:
-        """Computes the residuals between `y_true` and `y_pred`."""
+    def residuals(self, y_pred: Any, y_true: Any) -> Tensor:
+        """Computes the residuals between `y_pred` and `y_true`."""
         pass
 
 
@@ -29,24 +29,24 @@ class MSELoss(Loss):
         """Initializes the MeanSquaredError loss function."""
         super().__init__()
 
-    def forward(self, y_true: Tensor, y_pred: Tensor) -> Tensor:
+    def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
         """Computes the mean squared error loss.
 
         Args:
-            y_true: Ground truth target tensor.
             y_pred: Predicted tensor.
+            y_true: Ground truth target tensor.
 
         Returns:
             A scalar tensor representing the loss.
         """
         return (y_pred - y_true).square().mean()
 
-    def residuals(self, y_true: Tensor, y_pred: Tensor) -> Tensor:
+    def residuals(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
         """Computes the residuals for mean squared error.
 
         Args:
-            y_true: Ground truth target tensor.
             y_pred: Predicted tensor.
+            y_true: Ground truth target tensor.
 
         Returns:
             A tensor representing the residuals.
@@ -76,24 +76,24 @@ class LossWrapper(Loss):
         super().__init__()
         self.loss_fn = loss_fn
 
-    def forward(self, y_true: Tensor, y_pred: Tensor) -> Tensor:
+    def forward(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
         """Computes the wrapped loss function.
 
         Args:
-            y_true: Ground truth target tensor.
             y_pred: Predicted tensor.
+            y_true: Ground truth target tensor.
 
         Returns:
             Tensor: A scalar tensor representing the loss computed by the wrapped loss.
         """
         return self.loss_fn(y_pred, y_true, reduction='mean')
 
-    def residuals(self, y_true: Tensor, y_pred: Tensor) -> Tensor:
+    def residuals(self, y_pred: Tensor, y_true: Tensor) -> Tensor:
         """Computes the residuals using the wrapped loss function.
 
         Args:
-            y_true: Ground truth target tensor.
             y_pred: Predicted tensor.
+            y_true: Ground truth target tensor.
 
         Returns:
             Tensor: A tensor representing the residuals, computed as the square root of
