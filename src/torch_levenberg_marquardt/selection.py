@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Iterable, Literal
 
 import torch
+from torch import Tensor
 
 
 class ParamSelectionStrategy(ABC):
@@ -13,7 +14,7 @@ class ParamSelectionStrategy(ABC):
     """
 
     @abstractmethod
-    def select_parameters(self) -> torch.Tensor:
+    def select_parameters(self) -> Tensor:
         """Selects a subset of parameters for the current training step.
 
         Returns:
@@ -54,7 +55,7 @@ class RandomSelectionStrategy(ParamSelectionStrategy):
         self.subset_size = subset_size
         self.device = self.params[0].device if self.params else torch.device('cpu')
 
-    def select_parameters(self) -> torch.Tensor:
+    def select_parameters(self) -> Tensor:
         """Selects a random subset of parameters.
 
         Returns:
@@ -103,7 +104,7 @@ class LayerSelectionStrategy(ParamSelectionStrategy):
         # For 'cyclic' mode, keep track of the current parameter index
         self.current_param_idx = 0
 
-    def select_parameters(self) -> torch.Tensor:
+    def select_parameters(self) -> Tensor:
         """Selects parameters corresponding to a single parameter tensor.
 
         Returns:

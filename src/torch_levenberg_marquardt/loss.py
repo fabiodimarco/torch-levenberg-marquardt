@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -8,12 +9,12 @@ class Loss(torch.nn.Module, ABC):
     """Base class for all loss functions using ABC."""
 
     @abstractmethod
-    def forward(self, y_true: Tensor, y_pred: Tensor) -> Tensor:
+    def forward(self, y_true: Any, y_pred: Any) -> Tensor:
         """Computes the loss between `y_true` and `y_pred`."""
         pass
 
     @abstractmethod
-    def residuals(self, y_true: Tensor, y_pred: Tensor) -> Tensor:
+    def residuals(self, y_true: Any, y_pred: Any) -> Tensor:
         """Computes the residuals between `y_true` and `y_pred`."""
         pass
 

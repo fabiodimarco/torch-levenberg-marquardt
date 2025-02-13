@@ -1,13 +1,15 @@
-from typing import Generator
+from typing import Any, Callable, Generator
 
 import pytorch_lightning as pl
 import torch
 from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data._utils.collate import default_collate
 from torchmetrics import Metric
 from tqdm import tqdm
 
 from .training import TrainingModule
+from .tree import tree_indices, tree_to_device
 
 
 class CustomLightningModule(pl.LightningModule):
@@ -50,7 +52,7 @@ class CustomLightningModule(pl.LightningModule):
             batch_idx: The index of the batch (required by PyTorch Lightning).
 
         Returns:
-            Tensor: The computed loss for the current batch.
+            The computed loss for the current batch.
         """
         inputs, targets = batch
 
@@ -63,7 +65,7 @@ class CustomLightningModule(pl.LightningModule):
         logs = {
             key: (
                 value
-                if isinstance(value, torch.Tensor)
+                if isinstance(value, Tensor)
                 else torch.tensor(value, dtype=torch.float32)
             )
             for key, value in logs.items()
@@ -95,7 +97,7 @@ class CustomLightningModule(pl.LightningModule):
         """Prevents PyTorch Lightning from performing optimizer steps.
 
         Returns:
-            list: An empty list as no optimizers are used in this module.
+            An empty list as no optimizers are used in this module.
         """
         return []
 
@@ -106,7 +108,7 @@ class CustomLightningModule(pl.LightningModule):
             x: Input tensor to the model.
 
         Returns:
-            Tensor: The output of the model.
+            The output of the model.
         """
         return self.training_module.model(x)
 
@@ -157,7 +159,8 @@ def fit(
 
         for step, (inputs, targets) in enumerate(dataloader):
             # Ensure that inputs and targets are on the same device as the model
-            inputs, targets = inputs.to(device), targets.to(device)
+            inputs = tree_to_device(inputs, device)
+            targets = tree_to_device(targets, device)
 
             # Perform a training step
             outputs, loss, stop_training, logs = training_module.training_step(
@@ -177,7 +180,7 @@ def fit(
                 for name, metric in metrics.items():
                     formatted_logs[name] = metric.compute().item()
             for key, value in logs.items():
-                if isinstance(value, torch.Tensor):
+                if isinstance(value, Tensor):
                     value = value.item()
                 formatted_logs[key] = (
                     f'{value:.4e}' if isinstance(value, float) else str(value)
@@ -227,10 +230,10 @@ def fit(
 class FastDataLoader(DataLoader):
     """A lightweight and efficient data loader optimized for small datasets.
 
-    This class addresses the performance bottleneck caused by the overhead of
+    This loader addresses the performance bottleneck caused by the overhead of
     `torch.utils.data.DataLoader` when dealing with small models or datasets that can
-    fit entirely into RAM or GPU memory. By preloading the entire dataset into memory,
-    it eliminates unnecessary overhead and significantly accelerates the training.
+    fit entirely into RAM or GPU memory. The entire dataset is preloaded into memory and
+    collated using a provided or default collate function.
     """
 
     def __init__(
@@ -240,72 +243,61 @@ class FastDataLoader(DataLoader):
         repeat: int = 1,
         shuffle: bool = False,
         device: torch.device | str = 'cpu',
+        collate_fn: Callable[[list], Any] | None = None,
     ) -> None:
-        """
-        Initializes the FastDataLoader.
+        """Initializes the FastDataLoader.
 
         Args:
-            dataset: A PyTorch Dataset from which data and targets will be extracted.
+            dataset: A PyTorch Dataset from which data will be extracted.
             batch_size: Number of samples per batch.
             repeat: Number of times to repeat the dataset.
             shuffle: If True, shuffle the data at the start of each repetition.
-
-        Raises:
-            ValueError: If data and targets have mismatched sizes.
+            device: The device on which to load the data.
+            collate_fn: A function used to collate individual samples into a batch.
+                        If None, the default_collate function is used.
         """
         super().__init__(dataset=dataset, batch_size=batch_size)
-
         self.repeat = repeat
         self.shuffle = shuffle
 
-        data, targets = zip(*((data, target) for data, target in dataset))
+        # Build the sample list using indexing.
+        self.examples = list(dataset)  # type: ignore
+        self.num_examples = len(self.examples)
 
-        assert len(data) > 0
-        assert len(targets) > 0
+        # Use default_collate if no collate function is provided.
+        if collate_fn is None:
+            collate_fn = default_collate
 
-        self.data = (
-            torch.stack(data)
-            if isinstance(data[0], torch.Tensor)
-            else torch.tensor(data)
-        ).to(device)
-        self.targets = (
-            torch.stack(targets)
-            if isinstance(targets[0], torch.Tensor)
-            else torch.tensor(targets)
-        ).to(device)
+        # Pre-collate the entire dataset and move it to the desired device.
+        self.examples = collate_fn(self.examples)
+        self.examples = tree_to_device(self.examples, device)
 
-        if self.data.size(0) != self.targets.size(0):
-            raise ValueError("Data and targets must have the same number of samples.")
+    def __iter__(self) -> Generator[Any, Any, None]:
+        """Creates an iterator that yields batches of data.
 
-        self.n_samples = self.data.size(0)
-
-    def __iter__(self) -> Generator[tuple[Tensor, Tensor], None, None]:
-        """
-        Generates batches of data and targets.
+        For each repetition, if shuffling is enabled, the dataset indices are shuffled
+        before batching. Batches are then produced by selecting the appropriate indices
+        from the pre-collated data.
 
         Yields:
-            A tuple (batch_data, batch_targets) for each batch.
+            A batch of data from the pre-collated dataset.
         """
         assert self.batch_size
-
         for _ in range(self.repeat):
-            indices = torch.arange(self.n_samples)
+            indices = torch.arange(self.num_examples)
             if self.shuffle:
-                indices = indices[torch.randperm(self.n_samples)]
-
-            for i in range(0, self.n_samples, self.batch_size):
+                indices = indices[torch.randperm(self.num_examples)]
+            indices = indices.tolist()
+            for i in range(0, self.num_examples, self.batch_size):
                 batch_indices = indices[i : i + self.batch_size]
-                yield self.data[batch_indices], self.targets[batch_indices]
+                yield tree_indices(self.examples, batch_indices)
 
     def __len__(self) -> int:
-        """
-        Returns the total number of batches.
+        """Returns the total number of batches across all repetitions.
 
         Returns:
-            Total number of batches across all repeats.
+            The number of batches in one epoch multiplied by the number of repetitions.
         """
-        assert self.n_samples
         assert self.batch_size
-
-        batches_per_epoch = (self.n_samples + self.batch_size - 1) // self.batch_size
+        batches_per_epoch = (self.num_examples + self.batch_size - 1) // self.batch_size
         return self.repeat * batches_per_epoch

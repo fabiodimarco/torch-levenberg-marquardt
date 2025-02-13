@@ -11,6 +11,7 @@ from torch.func import functional_call, jacrev, vmap
 from .damping import DampingStrategy, StandardDampingStrategy
 from .loss import Loss, MSELoss
 from .selection import ParamSelectionStrategy
+from .tree import tree_cat, tree_first_tensor, tree_slice, tree_unsqueeze
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +22,9 @@ class TrainingModule(ABC):
     @abstractmethod
     def training_step(
         self,
-        inputs: Tensor,
-        targets: Tensor,
-    ) -> tuple[Tensor, Tensor, bool, dict[str, Any]]:
+        inputs: Any,
+        targets: Any,
+    ) -> tuple[Any, Tensor, bool, dict[str, Any]]:
         """Performs a single training step."""
         pass
 
@@ -115,7 +116,7 @@ class LevenbergMarquardtModule(TrainingModule):
         self._num_params = sum(p.numel() for p in self._params.values())
 
         # Precompute splits for flat_params
-        self._splits = [param.numel() for param in self._params.values()]
+        self._splits = [p.numel() for p in self._params.values()]
 
         # Flatten all trainable parameters into a single tensor
         self.flat_params = torch.cat(
@@ -139,7 +140,8 @@ class LevenbergMarquardtModule(TrainingModule):
             **dict(self._model.named_buffers()),
         }
 
-        self._num_residuals_per_batch = None
+        self._batch_size: int | None = None
+        self._num_residuals: int | None = None
 
     @torch.no_grad()
     def backup_parameters(self) -> None:
@@ -154,42 +156,13 @@ class LevenbergMarquardtModule(TrainingModule):
     @torch.no_grad()
     def reset(self) -> None:
         """Resets internal state, including the damping factor and outputs."""
-        self._num_residuals_per_batch = None
+        self._batch_size = None
+        self._num_residuals = None
         self.damping_strategy.reset()
 
-    def forward(self, inputs: Tensor) -> Tensor:
+    def forward(self, inputs: Any) -> Any:
         """Performs a forward pass using the current model parameters."""
         return functional_call(self._model, self._params_and_buffers, inputs)
-
-    @torch.no_grad()
-    def _compute_num_residuals_per_batch(self, inputs: Tensor, targets: Tensor) -> int:
-        """Computes the number of outputs from the model.
-
-        Args:
-            inputs: Input tensor.
-            targets: Target tensor.
-
-        Returns:
-            The number of outputs produced by the model.
-        """
-        # Create dummy inputs and targets with batch size zero
-        input_shape = inputs.shape[1:]  # Exclude batch dimension
-        target_shape = targets.shape[1:]  # Exclude batch dimension
-
-        dummy_inputs = torch.zeros(
-            (1,) + input_shape, dtype=inputs.dtype, device=inputs.device
-        )
-        dummy_targets = torch.zeros(
-            (1,) + target_shape, dtype=targets.dtype, device=targets.device
-        )
-
-        # Pass inputs through the model
-        outputs = self._model(dummy_inputs)
-
-        # Compute residuals
-        residuals = self.loss_fn.residuals(dummy_targets, outputs)
-
-        return residuals.numel()
 
     @torch.no_grad()
     def _solve(self, matrix: Tensor, rhs: Tensor) -> Tensor:
@@ -231,10 +204,10 @@ class LevenbergMarquardtModule(TrainingModule):
     @torch.no_grad()
     def _compute_jacobian(
         self,
-        inputs: Tensor,
-        targets: Tensor,
+        inputs: Any,
+        targets: Any,
         param_indices: Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Any]:
         """Computes the Jacobian of the residuals with respect to model parameters.
 
         Args:
@@ -250,9 +223,7 @@ class LevenbergMarquardtModule(TrainingModule):
         """
         buffers = dict(self._model.named_buffers())
 
-        def compute_residuals(
-            flat_params: Tensor, input: Tensor, target: Tensor
-        ) -> Tensor:
+        def compute_residuals(flat_params: Tensor, input: Any, target: Any) -> Tensor:
             if param_indices is not None:
                 full_params = self.flat_params.clone()
                 full_params[param_indices] = flat_params
@@ -287,8 +258,12 @@ class LevenbergMarquardtModule(TrainingModule):
         if self.use_vmap:
             # Compute per-sample Jacobian with vmap and jacrev
             jacobian_func = jacrev(compute_residuals)
-            jacobians = vmap(jacobian_func, in_dims=(None, 0, 0))(
-                flat_params, inputs.unsqueeze(1), targets.unsqueeze(1)
+            jacobians = vmap(
+                jacobian_func, in_dims=(None, 0, 0), randomness='different'
+            )(
+                flat_params,
+                tree_unsqueeze(inputs, dim=1),
+                tree_unsqueeze(targets, dim=1),
             )
             jacobians = jacobians.squeeze(1)
         else:
@@ -298,17 +273,17 @@ class LevenbergMarquardtModule(TrainingModule):
 
         # Flatten batches and outputs into a matrix to solve least-squares problems.
         residuals = residuals.view(-1, 1)
-        jacobians = jacobians.view(-1, flat_params.numel())
+        jacobians = jacobians.view(-1, self._num_params)
 
         return jacobians, residuals, outputs
 
     @torch.no_grad()
     def _sliced_gauss_newton_overdetermined(
         self,
-        inputs: Tensor,
-        targets: Tensor,
+        inputs: Any,
+        targets: Any,
         param_indices: Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Any]:
         """Gauss-Newton approximation for overdetermined systems using slicing.
 
         This method handles large overdetermined systems by dividing the input into
@@ -328,24 +303,27 @@ class LevenbergMarquardtModule(TrainingModule):
                 - outputs: `(batch_size, output_dim, ...)`
         """
         assert self.max_batch_size is not None
-        assert self._num_residuals_per_batch is not None
+        assert self._batch_size is not None
 
-        batch_size = inputs.shape[0]
+        batch_size = self._batch_size
         num_params = (
             param_indices.numel() if param_indices is not None else self._num_params
         )
 
-        JJ = torch.zeros(
-            (num_params, num_params), dtype=inputs.dtype, device=inputs.device
-        )
-        rhs = torch.zeros((num_params, 1), dtype=inputs.dtype, device=inputs.device)
+        # Use one tensor from the inputs to obtain device and dtype.
+        first_tensor = tree_first_tensor(inputs)
+        device = first_tensor.device
+        dtype = first_tensor.dtype
 
-        outputs_slices = []
+        JJ = torch.zeros((num_params, num_params), dtype=dtype, device=device)
+        rhs = torch.zeros((num_params, 1), dtype=dtype, device=device)
+
+        outputs_slices: list[Any] = []
 
         for start in range(0, batch_size, self.max_batch_size):
             end = min(start + self.max_batch_size, batch_size)
-            inputs_slice = inputs[start:end]
-            targets_slice = targets[start:end]
+            inputs_slice = tree_slice(inputs, start, end)
+            targets_slice = tree_slice(targets, start, end)
 
             J_slice, residuals_slice, outputs_slice = self._compute_jacobian(
                 inputs_slice, targets_slice, param_indices
@@ -355,17 +333,16 @@ class LevenbergMarquardtModule(TrainingModule):
             JJ += J_slice.t().matmul(J_slice)
             rhs += J_slice.t().matmul(residuals_slice)
 
-        outputs = torch.cat(outputs_slices, dim=0)
-
+        outputs = tree_cat(outputs_slices, dim=0)
         return JJ, rhs, outputs
 
     @torch.no_grad()
     def _sliced_gauss_newton_underdetermined(
         self,
-        inputs: Tensor,
-        targets: Tensor,
+        inputs: Any,
+        targets: Any,
         param_indices: Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Any]:
         """Gauss-Newton approximation for underdetermined systems using slicing.
 
         This method handles large underdetermined systems by dividing the input into
@@ -385,18 +362,18 @@ class LevenbergMarquardtModule(TrainingModule):
                 - outputs: `(batch_size, output_dim, ...)`
         """
         assert self.max_batch_size is not None
-        assert self._num_residuals_per_batch is not None
+        assert self._batch_size is not None
 
-        batch_size = inputs.shape[0]
+        batch_size = self._batch_size
 
-        J_slices = []
-        residuals_slices = []
-        outputs_slices = []
+        J_slices: list[Tensor] = []
+        residuals_slices: list[Tensor] = []
+        outputs_slices: list[Any] = []
 
         for start in range(0, batch_size, self.max_batch_size):
             end = min(start + self.max_batch_size, batch_size)
-            inputs_slice = inputs[start:end]
-            targets_slice = targets[start:end]
+            inputs_slice = tree_slice(inputs, start, end)
+            targets_slice = tree_slice(targets, start, end)
 
             J_slice, residuals_slice, outputs_slice = self._compute_jacobian(
                 inputs_slice, targets_slice, param_indices
@@ -409,20 +386,19 @@ class LevenbergMarquardtModule(TrainingModule):
         # Concatenate all slices to form the full J, residuals, and outputs
         J = torch.cat(J_slices, dim=0)
         residuals = torch.cat(residuals_slices, dim=0)
-        outputs = torch.cat(outputs_slices, dim=0)
+        outputs = tree_cat(outputs_slices, dim=0)
 
         # Compute JJ and rhs as in the non-sliced scenario for underdetermined case
         JJ = J @ J.t()  # JJ = J * J'
         rhs = residuals  # rhs = residuals
-
         return J, JJ, rhs, outputs
 
     @torch.no_grad()
     def training_step(
         self,
-        inputs: Tensor,
-        targets: Tensor,
-    ) -> tuple[Tensor, Tensor, bool, dict[str, Any]]:
+        inputs: Any,
+        targets: Any,
+    ) -> tuple[Any, Tensor, bool, dict[str, Any]]:
         """Performs a single training step.
 
         Args:
@@ -436,12 +412,18 @@ class LevenbergMarquardtModule(TrainingModule):
                 - stop_training: Whether training should stop.
                 - logs: Additional metadata (e.g., damping factor, attempts).
         """
-        if self._num_residuals_per_batch is None:
+        if self._batch_size is None:
             # Initialize during the first train step
-            self._num_residuals_per_batch = self._compute_num_residuals_per_batch(
-                inputs, targets
-            )
+            outputs = self._model(inputs)
+            residuals = self.loss_fn.residuals(targets, outputs)
+            self._batch_size = residuals.shape[0]
+            self._num_residuals = residuals.numel()
 
+        assert self._batch_size
+        assert self._num_residuals
+
+        batch_size = self._batch_size
+        num_residuals = self._num_residuals
         num_params = self._num_params
 
         param_indices = None
@@ -449,11 +431,9 @@ class LevenbergMarquardtModule(TrainingModule):
             param_indices = self.param_selection_strategy.select_parameters()
             num_params = param_indices.numel()
 
-        batch_size = inputs.shape[0]
-        num_residuals = batch_size * self._num_residuals_per_batch
         overdetermined = num_residuals >= num_params
 
-        if self.max_batch_size is not None:
+        if self.max_batch_size is not None and self.max_batch_size < batch_size:
             # reduced memory sliced computation
             if overdetermined:
                 JJ, rhs, outputs = self._sliced_gauss_newton_overdetermined(
@@ -612,9 +592,9 @@ class OptimizerModule(TrainingModule):
 
     def training_step(
         self,
-        inputs: Tensor,
-        targets: Tensor,
-    ) -> tuple[Tensor, Tensor, bool, dict[str, Any]]:
+        inputs: Any,
+        targets: Any,
+    ) -> tuple[Any, Tensor, bool, dict[str, Any]]:
         """Performs a training step using a standard optimizer.
 
         This method computes the loss for the given inputs and targets, performs
@@ -633,7 +613,7 @@ class OptimizerModule(TrainingModule):
         """
         # Forward pass
         outputs = self._model(inputs)
-        loss: Tensor = self.loss_fn(outputs, targets)
+        loss: Tensor = self.loss_fn(targets, outputs)
 
         # Backward pass and optimization
         self.optimizer.zero_grad()
