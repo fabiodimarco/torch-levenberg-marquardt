@@ -273,7 +273,7 @@ class LevenbergMarquardtModule(TrainingModule):
 
         # Flatten batches and outputs into a matrix to solve least-squares problems.
         residuals = residuals.view(-1, 1)
-        jacobians = jacobians.view(-1, self._num_params)
+        jacobians = jacobians.view(-1, flat_params.numel())
 
         return jacobians, residuals, outputs
 
